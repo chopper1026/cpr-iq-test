@@ -1,53 +1,51 @@
 # 阶段交接与验证快照
 
-适用提交基线：`bc6021d144445e63ab76264de371a24595dc8e21`（`main`）。证据日期：2026-11-25（Asia/Shanghai）。
+证据日期：2026-11-25（Asia/Shanghai）。
 
-本文记录当前开发预览阶段的多平台验证矩阵、分层证据与授权边界；软件项目不涉及硬件槽位字段。未执行层级均标为「未验证」，历史提交的局部通过不追认为全平台或当前构建通过。
+本文记录当前多平台验证矩阵、分层证据与授权边界；软件项目不涉及硬件槽位字段。未执行层级均标为「未验证」，历史提交的局部通过不追认为全平台或当前构建通过。
 
 ## 当前状态与入口
 
-- **阶段目标**：完成开发预览包的三平台 GitHub Actions 验证（`prerelease=true`），后续在隔离测试实例取得授权健康 OpenAI OAuth 账号校准证据后，再决定是否写入 `data/profiles.json` 并开启正式发版。
+- **阶段目标**：修复线上 `v0.1.0-dev.1` 流解析 `Reason::Incomplete` 缺陷，移除 24 小时探针预算与校准模式限制，上线宿主全部模型与推理档位自动拉取、账号真实邮箱展示以及独立「任务记录」筛选分页 Tab 页，待推送并经 GitHub Actions 三平台构建验证后供线上升级。
 - **权威入口**：
   - 安装与日常使用：[README.md](../../README.md)
-  - 校准、隔离 smoke、自动跟版与回滚：[docs/release.md](../release.md)
+  - 隔离 smoke、自动跟版与回滚：[docs/release.md](../release.md)
   - 系统边界与模块契约：[ARCHITECTURE.md](ARCHITECTURE.md)
   - 持久化、配额与备份边界：[PERSISTENCE.md](PERSISTENCE.md)
   - 功能实现与分层证据：[FEATURES.md](FEATURES.md)
   - 开发治理导航：[INDEX.md](INDEX.md)
-- **当前主要阻断与风险**：
-  1. `data/profiles.json` 中唯一档位 `gpt6-sol-low` 仍为 `validation: null`，正式判定、定时巡检和生产发布均保持关闭。
-  2. `bc6021d` 修复了 run `45629428949` 中 `old` 跳过导致 `rebuild` 被误跳过的问题，但尚未完成推送后的远端三平台 `prerelease=true` 复跑。
+- **当前主要待办与风险**：
+  1. 尚未执行线上真实 OAuth 账号的端到端模型目录拉取与指纹实跑验证（已通过宿主源码核对与单测/隔离 smoke 覆盖协议细节）。
+  2. 尚未推送至 GitHub 触发 Linux x86_64 / Linux ARM64 / macOS ARM64 三平台 CI 重建与 smoke。
 
 ## 构建与运行身份
 
-- **基线提交**：`bc6021d144445e63ab76264de371a24595dc8e21`（`main`）；插件版本：`0.1.0`（`plugin.json` 与 `Cargo.toml` 一致）。
+- **插件版本**：`0.1.0`（`plugin.json` 与 `Cargo.toml` 一致；本地验收包版本 `0.1.0-dev.2`）。
 - **锁定外部契约**：
   - 宿主目标：`zyycn/codex-proxy-rs` `v3.54.5`（commit `45a4d580c7e1ac2b2c0308d72ae5018148f2516a`，`engines.codex-proxy-rs: ~3.54.5`）。
   - 参考检测库：`Ikaleio/lm-detector` commit `e0472890bea827d15ca883636a77d4c10bbe843b`（`unified_bank.json` 与 `shared_detector.bin` 锁于 `data/detector.lock.json`）。
   - 工具链：Rust `1.99.1`（`rust-toolchain.toml`）、Python `3.12+`。
 - **三平台产物与验证矩阵**：
 
-| 目标平台三元组 | CI runner | 最近已知构建身份与产物摘要 | Linux `maxGlibc` | 隔离宿主 smoke 状态 |
+| 目标平台三元组 | CI runner | 最近已知构建身份 | Linux `maxGlibc` | 隔离宿主 smoke 状态 |
 | --- | --- | --- | --- | --- |
-| `aarch64-apple-darwin` | `macos-15` | 2026-11-25 首次接入前本机开发包 `cpr-iq-test.account-fingerprint-0.1.0-dev.1-aarch64-apple-darwin.tar.gz`，SHA-256 `d6791b714f968122155770f920c94ef6487e5d9a5a8be0cb32ef852cc9d9adfe`（非 `bc6021d` CI 重编产物） | 不适用 | 本机 `v3.54.5` 通过（含 `0.0.0` → `0.1.0-dev.1` 状态切换与重启）；远端 `macos-15` runner **未验证** |
-| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | 未构建（无已核对产物摘要） | 未验证 | 未验证 |
-| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | 未构建（无已核对产物摘要） | 未验证 | 未验证 |
+| `aarch64-apple-darwin` | `macos-15` | 2026-11-25 本机开发包 `0.1.0-dev.2-aarch64-apple-darwin.tar.gz`（位于 `.work/smoke-dist/`，未入库） | 不适用 | 本机 `v3.54.5` 通过（含 `0.0.0 → 0.1.0-dev.2` 状态切换、旧版迁移与重启）；远端 `macos-15` runner **未验证** |
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | 未构建 | 未验证 | 未验证 |
+| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | 未构建 | 未验证 | 未验证 |
 
 ## 验证证据
 
 | 层级 | 当次实际操作 / 证据位置 | 日期 / 对象 / 环境 | 结果与覆盖限制 |
 | --- | --- | --- | --- |
-| 源码与配置静态检查 | `cargo fmt --all -- --check`、`cargo clippy --offline --locked --all-targets -- -D warnings`、`node --check web/app.js`、`actionlint .github/workflows/*.yml`、`tidy.py audit-docs`、`tidy.py check` | 2026-11-25 / `ec0957f`（Rust/JS）与 `700e059`/`bc6021d`（YAML/发版脚本） / macOS ARM64 | 通过；静态与文档引用检查不代表运行期或跨平台验收。 |
-| 单元与宿主合同测试 | `CPR_REQUIRE_BANK=1 cargo test --offline --locked --all-targets`（16 项）、`scripts/check_bound_host.sh`（2 条 Core 合同）、`python3 -m unittest discover -s tests -p 'test_*.py'`（18 项）、`scripts/detector_assets.py --verify-only`、`scripts/release_gate.py preflight` | 2026-11-25 / `ec0957f`（Rust/宿主合同）与 `700e059`（18 项 Python 发版回归与只读 preflight） / macOS ARM64，Rust `1.99.1`，Python `3.12` | 通过；无真实 OAuth 调用，参考语料异标签用例不代表准确率评估。 |
-| 产品构建与打包 | `scripts/package.py`（本机 macOS ARM64）；三平台 CI `follow-host.yml` `rebuild` 矩阵 | 2026-11-25 / 首次接入工作区（本机 macOS ARM64） | 本机 macOS ARM64 `0.1.0-dev.1` 通过；三平台 CI 构建与 Linux `maxGlibc` 记录**未验证**。 |
-| 隔离宿主 smoke 与状态切换 | `scripts/smoke_host.py`（`v3.54.5`，含 `--baseline` `0.0.0` → `0.1.0-dev.1` 与重启） | 2026-11-25 / 首次接入工作区 / macOS ARM64 | 通过（设置与合成历史保留，无真实模型调用）；Linux 两平台与跨宿主版本切换**未验证**。 |
-| 远端 Release 摘要与回算核验 | `.github/workflows/follow-host.yml`（`prerelease=true` 或正式发布）、`scripts/release_gate.py publish`、`publish-receipt.json` | — | **未验证**（仅有 18 项离线桩单测覆盖，尚无远端实跑成功回执）。 |
-| 授权 OAuth 校准正例 | 隔离测试实例人工校准并核验 `data/profiles.json` `validation` 证据 | — | **未验证**（`gpt6-sol-low` 仍为 `validation: null`）。 |
-| 生产实例切换与回滚 | 管理员核对兼容表后于生产实例安装/切换 | — | **未验证**（未开放生产发布）。 |
+| 源码与配置静态检查 | `cargo fmt --all --check`、`cargo clippy --locked --all-targets -- -D warnings`、`node --check web/app.js`、`actionlint`、`tidy.py audit-docs`、`tidy.py check` | 2026-11-25 / 本次重构工作区 / macOS ARM64 | 通过；静态与文档检查不代表线上运行验收。 |
+| 单元与宿主合同测试 | `CPR_REQUIRE_BANK=1 cargo test --locked --all-targets`（19 项）、`python3 -m unittest discover -s tests -p 'test_*.py'`（17 项）、`scripts/detector_assets.py --verify-only`、`follow_host.contract`（16 项回调） | 2026-11-25 / 本次重构工作区 / macOS ARM64，Rust `1.99.1`，Python `3.12` | 通过；无真实线上 OAuth 调用。`scripts/check_bound_host.sh`（2 条 Core 合同）基线已于 `ec0957f` 验证。 |
+| 产品构建与隔离宿主 smoke | `scripts/package.py` + `scripts/smoke_host.py --docker-services`（`v3.54.5`，`0.0.0 → 0.1.0-dev.2` 含 `v0.1.0-dev.1` 旧记录迁移、邮箱搜索、筛选分页与重启） | 2026-11-25 / 本次重构工作区 / macOS ARM64 | 通过；Linux 两平台与线上真实 OAuth 调用**未验证**。 |
+| 远端 Release 摘要与回算核验 | `.github/workflows/follow-host.yml`、`scripts/release_gate.py publish`、`publish-receipt.json` | — | **未验证**（仅有 17 项离线桩单测覆盖，待推送后由管理员触发工作流实跑）。 |
+| 线上真实 OAuth 实例验收 | 管理员上传新包并切换实例后实测目录拉取、手动与定时指纹检测 | — | **未验证**（待本次发包后线上复测）。 |
 
 ## 后续行动与授权边界
 
-1. **只读本地预检（无副作用）**：`python3 scripts/release_gate.py preflight`（按需加 `--online --repository <owner>/<repo>`）。
-2. **远端预发布验证（需管理员触发 GitHub Actions）**：在默认分支 `bc6021d`（或含后续确认提交的 HEAD）手动触发 **Verify new CPR stable releases**（`host_tag=v3.54.5`、`prerelease=true`，可先选 `dry_run=true` 演练），检查三平台 `candidate-*`、`maxGlibc`、远端 5 份附件摘要核验与 `publish-receipt.json`。
-3. **授权校准与正式发版前提**：仅在隔离实例用授权正常 OAuth 账号完成校准并向 `data/profiles.json` 提交真实证据后，再由维护者显式评估开启 `CPR_ENABLE_PUBLISH=true`。
+1. **只读本地预检**：`python3 scripts/release_gate.py preflight`（按需加 `--online --repository <owner>/<repo>`）。
+2. **远端三平台发包（需管理员授权推送与触发 GitHub Actions）**：推送本次提交后在默认分支触发 **Verify new CPR stable releases**（`host_tag=v3.54.5`，按需选 `prerelease=true` 或开启 `CPR_ENABLE_PUBLISH=true` 正式发布），核对三平台产物、`maxGlibc` 与远端摘要回执。
+3. **线上升级注意**：在宿主管理页使用 **切换版本（`switch-version`）** 升级现有实例，无需删除实例；旧版 `v0.1.0-dev.1` 历史记录将自动兼容迁移。
 4. **授权边界**：本交接快照不授予 `git push`、创建远端 Release、修改 `cpr-compatibility`、写入 OAuth 凭据或生产实例切换权限；所有外部副作用均须独立明确授权。

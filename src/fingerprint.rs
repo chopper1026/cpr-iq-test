@@ -1,7 +1,7 @@
 //! LM Detector is called only through its offline API. The bus never sends credentials to it.
-use crate::domain::{Candidate, Mode, PROBES_PER_ROUND, Ranking, Reason, Round};
+use crate::domain::{Candidate, PROBES_PER_ROUND, Ranking, Reason, Round};
 use lmfpd::{Analysis, Challenge, Decision, Detector, LoadOptions, Output, ProbabilityStatus};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,8 +11,7 @@ use std::{
 };
 
 const LOCK_BYTES: &[u8] = include_bytes!("../data/detector.lock.json");
-const PROFILES_BYTES: &[u8] = include_bytes!("../data/profiles.json");
-const POLICY: &str = "responses-openai-strict-rank-v1";
+const POLICY: &str = "responses-openai-strict-rank-v2";
 
 #[derive(Debug, Deserialize)]
 struct LockedAsset {
@@ -26,67 +25,10 @@ struct BankLock {
     files: BTreeMap<String, LockedAsset>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Profile {
-    pub id: String,
-    pub model: String,
-    pub effort: String,
-    pub label_id: String,
-    pub validation: Option<Validation>,
-}
-
-/// Presence alone is insufficient. Validation is bound to the *exact* bank and request profile.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Validation {
-    profile_stamp: String,
-    host_tag: String,
-    evidence: String,
-    positive_rounds: u16,
-    minimum_margin_bps: u16,
-}
-
-impl Profile {
-    fn stamp(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(LOCK_BYTES);
-        for field in [POLICY, &self.id, &self.model, &self.effort, &self.label_id] {
-            hasher.update([0]);
-            hasher.update(field.as_bytes());
-        }
-        format!("{:x}", hasher.finalize())
-    }
-
-    pub fn minimum_margin(&self) -> Option<u16> {
-        self.validation
-            .as_ref()
-            .filter(|e| {
-                e.profile_stamp == self.stamp()
-                    && e.host_tag.starts_with('v')
-                    && !e.evidence.trim().is_empty()
-                    && e.positive_rounds > 0
-                    && (1..=10_000).contains(&e.minimum_margin_bps)
-            })
-            .map(|e| e.minimum_margin_bps)
-    }
-
-    pub fn round_stamp(&self, credential_revision: u64) -> String {
-        format!(
-            "{:x}",
-            Sha256::digest(format!(
-                "{}:{:?}:{credential_revision}",
-                self.stamp(),
-                self.minimum_margin()
-            ))
-        )
-    }
-}
-
 pub struct Fingerprint {
     detector: Detector,
-    profiles: Vec<Profile>,
     labels: BTreeMap<String, String>,
+    aliases: BTreeMap<String, String>,
     pub revision: String,
 }
 
@@ -108,31 +50,34 @@ impl Fingerprint {
             id: String,
             display_name: String,
         }
-        let labels: BTreeMap<_, _> = serde_json::from_reader::<_, Labels>(std::io::BufReader::new(
+        let entries = serde_json::from_reader::<_, Labels>(std::io::BufReader::new(
             File::open(local.join("unified_bank.json")).map_err(|_| fail)?,
         ))
         .map_err(|_| fail)?
-        .models
-        .into_iter()
-        .map(|entry| (entry.id, entry.display_name))
-        .collect();
-        let profiles: Vec<Profile> = serde_json::from_slice(PROFILES_BYTES).map_err(|_| fail)?;
-        let mut ids = BTreeSet::new();
-        if profiles.len() > 16
-            || profiles.iter().any(|p| {
-                !ids.insert(&p.id)
-                    || !labels.contains_key(&p.label_id)
-                    || p.id.is_empty()
-                    || p.id.len() > 64
-                    || p.model.is_empty()
-                    || p.model.len() > 128
-                    || !matches!(
-                        p.effort.as_str(),
-                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
-                    )
-            })
-        {
-            return Err(fail);
+        .models;
+        let mut labels = BTreeMap::new();
+        let mut aliases = BTreeMap::new();
+        for entry in entries {
+            let canonical = entry.id.clone();
+            aliases.insert(canonical.to_ascii_lowercase(), canonical.clone());
+            aliases.insert(entry.display_name.to_ascii_lowercase(), canonical.clone());
+            // Support merged reference names such as "gpt-6-astra/6.1-sol" -> "gpt-6.1-sol".
+            if let Some((left, right)) = entry.display_name.split_once('/') {
+                aliases.insert(left.trim().to_ascii_lowercase(), canonical.clone());
+                let right = right.trim();
+                if !right.is_empty() {
+                    aliases.insert(right.to_ascii_lowercase(), canonical.clone());
+                    if let Some((prefix, _)) = left.split_once('-')
+                        && !right.starts_with(&format!("{prefix}-"))
+                    {
+                        aliases.insert(
+                            format!("{prefix}-{right}").to_ascii_lowercase(),
+                            canonical.clone(),
+                        );
+                    }
+                }
+            }
+            labels.insert(entry.id, entry.display_name);
         }
         let detector = Detector::load(&LoadOptions {
             sources: vec![absolute.into()],
@@ -142,32 +87,30 @@ impl Fingerprint {
         .map_err(|_| fail)?;
         Ok(Self {
             detector,
-            profiles,
             labels,
+            aliases,
             revision: lock.revision,
         })
     }
 
-    pub fn options(&self) -> Vec<ProfileChoice<'_>> {
-        self.profiles
-            .iter()
-            .map(|profile| ProfileChoice {
-                id: &profile.id,
-                model: &profile.model,
-                effort: &profile.effort,
-                label_id: &profile.label_id,
-                label: &self.labels[&profile.label_id],
-                validated: profile.minimum_margin().is_some(),
-                profile_stamp: profile.stamp(),
-            })
-            .collect()
+    /// Maps a requested upstream model ID to its reference bank `(label_id, display_name)`, if present.
+    pub fn expected_label(&self, model: &str) -> Option<(&str, &str)> {
+        let key = model.trim().to_ascii_lowercase();
+        let id = self.aliases.get(&key)?;
+        let display = self.labels.get(id)?;
+        Some((id.as_str(), display.as_str()))
     }
 
-    pub fn profile(&self, id: &str, mode: Mode) -> Result<&Profile, Reason> {
-        self.profiles
-            .iter()
-            .find(|p| p.id == id && (mode == Mode::Calibration || p.minimum_margin().is_some()))
-            .ok_or(Reason::UnsupportedProfile)
+    /// Binds a round and optional confirmation retest to the exact bank lock, request pair, and credential version.
+    pub fn round_stamp(&self, model: &str, effort: &str, credential_revision: u64) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(LOCK_BYTES);
+        let revision_text = credential_revision.to_string();
+        for field in [POLICY, model, effort, &revision_text] {
+            hasher.update([0]);
+            hasher.update(field.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
     }
 
     pub fn challenges(&self) -> Result<Vec<Challenge>, Reason> {
@@ -202,8 +145,8 @@ fn summarize(analysis: Analysis, stamp: String, detector_revision: &str) -> Resu
     let prob = |value: Option<f64>| value.filter(|p| p.is_finite() && (0.0..=1.0).contains(p));
     let a = prob(candidates[0].probability).ok_or(Reason::NotScorable)?;
     let b = prob(candidates[1].probability).ok_or(Reason::NotScorable)?;
-    if a < b || (a - b).abs() < f64::EPSILON {
-        return Err(Reason::Nearby);
+    if a < b {
+        return Err(Reason::NotScorable);
     }
     let mut ids = BTreeSet::new();
     if candidates.iter().any(|c| {
@@ -219,29 +162,19 @@ fn summarize(analysis: Analysis, stamp: String, detector_revision: &str) -> Resu
     Ok(Round {
         stamp,
         detector_revision: detector_revision.into(),
-        top_margin_bps: ((a - b) * 10_000.0).floor() as u16,
+        top_margin_bps: ((a - b).max(0.0) * 10_000.0).floor() as u16,
         ranking: Ranking {
             candidates: candidates
                 .iter()
                 .map(|entry| Candidate {
                     id: entry.model.clone(),
                     label: entry.display_name.clone(),
+                    probability_bps: prob(entry.probability)
+                        .map(|p| (p * 10_000.0).round().clamp(0.0, 10_000.0) as u16),
                 })
                 .collect(),
         },
     })
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProfileChoice<'a> {
-    id: &'a str,
-    model: &'a str,
-    effort: &'a str,
-    label_id: &'a str,
-    label: &'a str,
-    validated: bool,
-    profile_stamp: String,
 }
 
 fn verify(file: &Path, expected: &LockedAsset) -> Result<(), Reason> {
@@ -270,7 +203,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bank_loads_offline_checks_both_assets_and_generates_independent_challenges() {
+    fn bank_loads_offline_checks_assets_matches_aliases_and_generates_independent_challenges() {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
         let bank = Fingerprint::load(&directory).ok();
         if std::env::var_os("CPR_REQUIRE_BANK").is_some() {
@@ -288,25 +221,21 @@ mod tests {
                 })
                 .collect();
             assert_eq!(bank.rank(&outputs, "test".into()), Err(Reason::NotScorable));
-            assert!(bank.profile("gpt6-sol-low", Mode::Calibration).is_ok());
+            assert_eq!(
+                bank.expected_label("gpt-6-sol"),
+                Some(("gpt-6-sol", "gpt-6-sol"))
+            );
+            assert_eq!(
+                bank.expected_label("gpt-6.1-sol"),
+                Some(("gpt-6-astra", "gpt-6-astra/6.1-sol"))
+            );
+            assert_eq!(bank.expected_label("not-in-reference-bank"), None);
+            assert_ne!(
+                bank.round_stamp("gpt-6-sol", "low", 1),
+                bank.round_stamp("gpt-6-sol", "high", 1)
+            );
         }
         assert!(Fingerprint::load(Path::new("does-not-exist")).is_err());
-    }
-
-    #[test]
-    fn evidence_is_tied_to_exact_model_effort_and_data() {
-        let mut profiles = serde_json::from_slice::<Vec<Profile>>(PROFILES_BYTES).unwrap();
-        let profile = profiles.first_mut().unwrap();
-        profile.validation = Some(Validation {
-            profile_stamp: profile.stamp(),
-            host_tag: "v3.54.5".into(),
-            evidence: "fixture".into(),
-            positive_rounds: 3,
-            minimum_margin_bps: 100,
-        });
-        assert_eq!(profile.minimum_margin(), Some(100));
-        profile.effort = "changed".into();
-        assert_eq!(profile.minimum_margin(), None);
     }
 }
 
@@ -331,15 +260,13 @@ fn a_known_different_label_repeats_with_independent_upstream_replies() {
     let second = bank.rank(&fixture.rounds[1], "one-bank".into()).unwrap();
     assert_eq!(first.ranking.candidates[0].id, fixture.label);
     assert_eq!(second.ranking.candidates[0].id, fixture.label);
-    // This is a frozen upstream reference fixture, not a live OAuth positive or a general accuracy test.
-    let expected = "claude-opus-4.8";
-    let VerdictDecision::Confirm(first) = domain::decide(Mode::Detect, expected, None, first)
-    else {
+    assert!(first.ranking.candidates[0].probability_bps.is_some());
+    // Frozen upstream reference fixture verifying 2-round Suspect decision pipeline.
+    let expected = Some("claude-opus-4.8");
+    let VerdictDecision::Confirm(first) = domain::decide(expected, None, first) else {
         panic!()
     };
-    let VerdictDecision::Finish(result) =
-        domain::decide(Mode::Detect, expected, Some(&first), second)
-    else {
+    let VerdictDecision::Finish(result) = domain::decide(expected, Some(&first), second) else {
         panic!()
     };
     assert_eq!(result.verdict, Verdict::Suspect);

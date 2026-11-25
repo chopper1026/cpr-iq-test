@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
-from detector_assets import file_sha, profile_stamp
+from detector_assets import file_sha
 from follow_host import TRIPLES, discovery, engine_matches, package_coverage, read_json, write_json
 from release_gate import (WORKFLOW_PATH, assemble, classify, filename, label, preflight, publish, reduce, rows_for,
                           verify_old, verify_remote_release, verify_resume)
@@ -56,7 +56,7 @@ class FollowRelease(unittest.TestCase):
     def status(self, triple, status, **more):
         version = self.plan["candidateVersion"] if status == "verified" else self.default_version
         return label(self.plan, triple, status, pluginVersion=version, asset=filename(version, triple), sha256="b" * 64,
-                     validatedProfiles=["fixture-approved"], sourceCommit=self.sha, **more)
+                     sourceCommit=self.sha, **more)
 
     def make_publish_fixture(self, root, *, write=True, route="rebuild"):
         self.plan["repository"] = "example/plugin"
@@ -96,16 +96,15 @@ class FollowRelease(unittest.TestCase):
         entry, _ = assemble(self.plan, rows, "rebuild", self.sha)
         self.assertEqual(entry["pluginVersion"], self.plan["candidateVersion"])
 
-    def test_blocked_host_or_unverified_profile_is_never_a_release(self):
+    def test_blocked_host_or_version_mismatch_is_never_a_release(self):
         row = [self.status(t, "reuse") for t in TRIPLES]
         row[2]["status"] = "block"
         self.assertEqual(classify(self.plan, row), "block")
         with self.assertRaisesRegex(ValueError, "Blocked route"):
             assemble(self.plan, row, "block", self.sha)
         row = [self.status(t, "verified") for t in TRIPLES]
-        for item in row:
-            item["validatedProfiles"] = []
-        with self.assertRaisesRegex(ValueError, "nonempty set"):
+        row[1]["pluginVersion"] = "9.9.9"
+        with self.assertRaisesRegex(ValueError, "disagree on plugin version"):
             assemble(self.plan, row, "rebuild", self.sha)
 
     def test_matrix_requires_all_platforms_from_same_host_commit(self):
@@ -133,7 +132,7 @@ class FollowRelease(unittest.TestCase):
     def test_old_package_integrity_and_smoke_are_required_not_claimed(self):
         triple = TRIPLES[0]
         artifact_name = filename(self.default_version, triple)
-        verification = {"pluginVersion": self.default_version, "validatedProfiles": ["fixture-approved"],
+        verification = {"pluginVersion": self.default_version,
                         "sourceCommit": self.sha, "sdkFingerprint": "ef",
                         "platforms": {triple: {"asset": artifact_name, "sha256": "b" * 64}}}
         with (patch("release_gate.release_asset", return_value=pathlib.Path("fixture.tar.gz")),
@@ -150,7 +149,7 @@ class FollowRelease(unittest.TestCase):
             verification["platforms"][triple]["sha256"] = "a" * 64
             self.assertEqual(verify_old(self.plan, triple, pathlib.Path("dummy"))["reason"], "prior package integrity")
 
-    def test_publish_rebuild_only_after_all_artifact_digests_and_evidence(self):
+    def test_publish_rebuild_only_after_all_artifact_digests(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = pathlib.Path(scratch)
             paths, packages = self.make_publish_fixture(root)
@@ -177,7 +176,6 @@ class FollowRelease(unittest.TestCase):
                   patch("release_gate.api", side_effect=fake_api),
                   patch("release_gate.own_releases", side_effect=fake_own_releases),
                   patch("release_gate.ref_commit", return_value=self.sha),
-                  patch("release_gate.verified_profiles", return_value=["fixture-approved"]) as evidence,
                   patch("release_gate.subprocess.run", side_effect=fake_run) as run,
                   patch("release_gate.git_write") as write,
                   patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true",
@@ -194,9 +192,6 @@ class FollowRelease(unittest.TestCase):
                 write.reset_mock()
                 packages[-1].write_text("changed")
                 with self.assertRaisesRegex(ValueError, "digest mismatch"):
-                    publish(paths)
-                evidence.return_value = []
-                with self.assertRaisesRegex(ValueError, "No authorized validation"):
                     publish(paths)
                 run.assert_not_called()
                 write.assert_not_called()
@@ -223,7 +218,6 @@ class FollowRelease(unittest.TestCase):
             with (patch("release_gate.ledger", return_value=None),
                   patch("release_gate.api", return_value=None),
                   patch("release_gate.own_releases", side_effect=fake_own_releases),
-                  patch("release_gate.verified_profiles", return_value=["fixture-approved"]),
                   patch("release_gate.subprocess.run", side_effect=fake_run) as run,
                   patch("release_gate.git_write") as write,
                   patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true",
@@ -268,7 +262,6 @@ class FollowRelease(unittest.TestCase):
             with (patch("release_gate.ledger", return_value=None),
                   patch("release_gate.api", return_value=None),
                   patch("release_gate.own_releases", return_value=[orphan]),
-                  patch("release_gate.verified_profiles", return_value=["fixture-approved"]),
                   patch("release_gate.subprocess.run") as run,
                   patch("release_gate.git_write") as write,
                   patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true",
@@ -298,7 +291,6 @@ class FollowRelease(unittest.TestCase):
                   patch("release_gate.api", side_effect=fake_api),
                   patch("release_gate.own_releases", side_effect=fake_own_releases),
                   patch("release_gate.ref_commit", return_value=self.sha),
-                  patch("release_gate.verified_profiles", return_value=["fixture-approved"]),
                   patch("release_gate.subprocess.run") as run,
                   patch("release_gate.git_write") as write,
                   patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true",
@@ -321,7 +313,6 @@ class FollowRelease(unittest.TestCase):
                   patch("release_gate.api", return_value={"object": {"type": "commit", "sha": "f" * 40}}),
                   patch("release_gate.own_releases", return_value=[existing]),
                   patch("release_gate.ref_commit", return_value="f" * 40),
-                  patch("release_gate.verified_profiles", return_value=["fixture-approved"]),
                   patch("release_gate.subprocess.run") as run,
                   patch("release_gate.git_write") as write,
                   patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true",
@@ -351,39 +342,29 @@ class FollowRelease(unittest.TestCase):
                 write.assert_called_once()
                 self.assertEqual((paths.output / "verification.json").read_text().count("prior-verified-detector"), 1)
 
-    def test_decide_short_circuits_and_gates_publish_evidence_before_rebuild(self):
+    def test_decide_short_circuits_without_old_outcomes_when_applicable(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = pathlib.Path(scratch)
             out = root / "decision.json"
             gh_out = root / "gh.out"
             plan_path = root / "plan.json"
 
-            # 1) No previous package, preview mode (require_validated=False): synthesizes rebuild without old/* files.
+            # 1) No previous package: synthesizes rebuild without old/* files.
             no_prev = {**self.plan, "previous": None}
             write_json(plan_path, no_prev)
             args = argparse.Namespace(plan=plan_path, input=root / "missing-outcomes", output=out,
-                                      github_output=gh_out, require_validated=False)
+                                      github_output=gh_out)
             reduce(args)
             self.assertEqual(read_json(out)["route"], "rebuild")
 
-            # 2) Same plan with publish enabled (require_validated=True) and no validated profiles: blocks early!
-            args.require_validated = True
-            with patch("release_gate.verified_profiles", return_value=[]):
-                with self.assertRaisesRegex(RuntimeError, "No authorized validation evidence"):
-                    reduce(args)
-            decision = read_json(out)
-            self.assertEqual(decision["route"], "block")
-            self.assertEqual(decision["blockReason"], "no-validated-profiles")
-
-            # 3) Contract problems short-circuit without old/* files.
+            # 2) Contract problems short-circuit without old/* files.
             broken = {**self.plan, "contract": {**self.plan["contract"], "problems": ["Manifest format"]}}
             write_json(plan_path, broken)
-            args.require_validated = False
             with self.assertRaisesRegex(RuntimeError, "Validation failed"):
                 reduce(args)
             self.assertEqual(read_json(out)["route"], "block")
 
-            # 4) Previous package present with missing old/* outcomes still fails closed.
+            # 3) Previous package present with missing old/* outcomes still fails closed.
             write_json(plan_path, self.plan)
             with self.assertRaisesRegex(ValueError, "Exactly one result per native platform"):
                 reduce(args)
@@ -418,28 +399,23 @@ class FollowRelease(unittest.TestCase):
             self.assertEqual(read_json(root / "summary.json")["needsCandidates"], True)
             self.assertIn("needs_candidates=true", gh_out.read_text())
 
-            # Mismatched commit SHA must fail closed.
             with patch("release_gate.api", return_value={**valid_run, "head_sha": "b" * 40}):
                 with self.assertRaisesRegex(ValueError, "head_sha"):
                     verify_resume(args)
 
-            # Non-default branch must fail closed.
             with patch("release_gate.api", return_value={**valid_run, "head_branch": "feature/x"}):
                 with self.assertRaisesRegex(ValueError, "default branch"):
                     verify_resume(args)
 
-            # Wrong workflow path must fail closed.
             with patch("release_gate.api", return_value={**valid_run, "path": ".github/workflows/checks.yml"}):
                 with self.assertRaisesRegex(ValueError, "belongs to"):
                     verify_resume(args)
 
-            # Missing one rebuild platform must fail closed.
             with patch("release_gate.api", side_effect=lambda r, missing=False:
                        {"jobs": valid_jobs[:-1]} if "/jobs?" in r else valid_run):
                 with self.assertRaisesRegex(ValueError, "missing successful 'rebuild' job"):
                     verify_resume(args)
 
-            # Reuse route requires 3 old jobs and needsCandidates=False.
             write_json(decision, {"route": "reuse", "results": []})
             reuse_jobs = [
                 {"name": "discover", "conclusion": "success"},
@@ -456,20 +432,17 @@ class FollowRelease(unittest.TestCase):
         with tempfile.TemporaryDirectory() as scratch:
             out = pathlib.Path(scratch) / "preflight.json"
             args = argparse.Namespace(online=False, repository="", tag="", output=out, strict=False)
-            with patch("release_gate.verified_profiles", return_value=[]):
+            dirty_git = argparse.Namespace(returncode=0, stdout=self.sha + "\n")
+            dirty_status = argparse.Namespace(returncode=0, stdout=" M README.md\n")
+            with patch("release_gate.subprocess.run", side_effect=[dirty_git, dirty_status]):
                 preflight(args)
                 report = json.loads(out.read_text())
                 self.assertEqual(report["pluginVersion"], report["cargoVersion"])
-                self.assertIn("no-validated-profiles", report["blockers"])
+                self.assertIn("dirty-working-tree", report["blockers"])
                 self.assertFalse(report["publishReady"])
-                args.strict = True
-                with self.assertRaisesRegex(RuntimeError, "Preflight blocked"):
-                    preflight(args)
-            args.strict = False
             clean_git = argparse.Namespace(returncode=0, stdout=self.sha + "\n")
             clean_status = argparse.Namespace(returncode=0, stdout="")
-            with (patch("release_gate.verified_profiles", return_value=["fixture-approved"]),
-                  patch("release_gate.subprocess.run", side_effect=[clean_git, clean_status])):
+            with patch("release_gate.subprocess.run", side_effect=[clean_git, clean_status]):
                 preflight(args)
                 ready = json.loads(out.read_text())
                 self.assertTrue(ready["publishReady"])
@@ -491,7 +464,6 @@ class FollowRelease(unittest.TestCase):
             for triple in TRIPLES:
                 cand = paths.input / triple / "candidate.json"
                 row = read_json(cand)
-                row["validatedProfiles"] = []
                 row["maxGlibc"] = "GLIBC_2.34" if triple.endswith("linux-gnu") else None
                 write_json(cand, row)
             tag = "v0.1.0-dev.1"
@@ -516,7 +488,6 @@ class FollowRelease(unittest.TestCase):
             with (patch("release_gate.api", side_effect=fake_api),
                   patch("release_gate.own_releases", side_effect=fake_own_releases),
                   patch("release_gate.ref_commit", return_value=self.sha),
-                  patch("release_gate.verified_profiles", return_value=[]),
                   patch("release_gate.subprocess.run", side_effect=fake_run) as run,
                   patch("release_gate.git_write") as write,
                   patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true"}, clear=False)):
@@ -534,10 +505,6 @@ class FollowRelease(unittest.TestCase):
                 paths.allow_prerelease = False
                 with self.assertRaisesRegex(ValueError, "--allow-prerelease"):
                     publish(paths)
-
-    def test_validation_stamp_changes_on_effort_change(self):
-        model = {"id": "example", "model": "model", "effort": "low", "labelId": "reference"}
-        self.assertNotEqual(profile_stamp(model), profile_stamp({**model, "effort": "high"}))
 
 
 if __name__ == "__main__":

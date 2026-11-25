@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the two pinned assets at build time, never from a running plugin."""
+"""Fetch and verify the two pinned detector assets at build time, never from a running plugin."""
 
 import argparse
 import hashlib
@@ -12,7 +12,6 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-POLICY = "responses-openai-strict-rank-v1"
 
 
 def file_sha(path):
@@ -28,32 +27,6 @@ def bank_lock():
     if set(lock["files"]) != {"unified_bank.json", "shared_detector.bin"}:
         raise ValueError("Both detector assets must be locked")
     return lock
-
-
-def profile_stamp(profile):
-    fields = [POLICY, *(profile[name] for name in ("id", "model", "effort", "labelId"))]
-    return hashlib.sha256((DATA / "detector.lock.json").read_bytes() + b"\x00" + "\x00".join(fields).encode()).hexdigest()
-
-
-def verified_profiles():
-    profiles = json.loads((DATA / "profiles.json").read_bytes())
-    result = []
-    for profile in profiles:
-        evidence = profile["validation"]
-        if evidence is None:
-            continue
-        if not (
-            evidence["profileStamp"] == profile_stamp(profile)
-            and evidence["hostTag"].startswith("v")
-            and evidence["evidence"].strip()
-            and isinstance(evidence["positiveRounds"], int)
-            and 0 < evidence["positiveRounds"] <= 65_535
-            and isinstance(evidence["minimumMarginBps"], int)
-            and 0 < evidence["minimumMarginBps"] <= 10_000
-        ):
-            raise ValueError(f'Validation evidence is invalid or stale for {profile["id"]}')
-        result.append(profile["id"])
-    return result
 
 
 def good(path, details):
@@ -93,19 +66,10 @@ def fetch_assets(lock, offline=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify-only", action="store_true")
-    parser.add_argument("--profiles", action="store_true", help="show profile stamps without fetching data")
-    parser.add_argument("--require-validated", action="store_true", help="fail if there is no verified profile")
     args = parser.parse_args()
     lock = bank_lock()
-    valid = verified_profiles()
-    if args.require_validated and not valid:
-        parser.exit(1, "No authorized validation evidence: production release blocked.\n")
-    if args.profiles:
-        print(json.dumps([{"id": p["id"], "profileStamp": profile_stamp(p), "validated": p["id"] in valid}
-                          for p in json.loads((DATA / "profiles.json").read_bytes())], indent=2))
-    else:
-        fetch_assets(lock, args.verify_only)
-        print(f"Verified detector pair at {lock['revision']}")
+    fetch_assets(lock, args.verify_only)
+    print(f"Verified detector pair at {lock['revision']}")
 
 
 if __name__ == "__main__":

@@ -1,39 +1,40 @@
 # 项目架构
 
-2026-11-25（Asia/Shanghai）首次盘点：覆盖 Rust 可执行文件、管理页、锁文件、打包脚本和工作流。实际通过的环境与能力见[功能全景](FEATURES.md)，不从架构描述推断生产验收。
+最近更新：2026-11-25（Asia/Shanghai）。覆盖 Rust 原生插件、双 Tab 管理页、离线参考指纹锁、打包脚本与自动化跟版工作流。实际验证状态与缺口见[功能全景](FEATURES.md)，不从架构描述推断全量验收。
 
 ## 系统边界
 
-`cpr-iq-test` 是 `codex-proxy-rs` 加载的独立原生插件，不 fork 宿主。宿主管理员通过嵌入页选账号和档位；宿主拥有管理员权限检查、OAuth 凭据、Client Key、模型执行、限流及计费。插件使用账号及 Key ID，返回参考指纹排名和结论，不写账号、路由或计费配置，不把排名当成模型身份认证。
+`cpr-iq-test` 是 `codex-proxy-rs` 加载的独立原生插件，不 fork 宿主。管理员通过嵌入管理页选择测试 Client Key、模型、推理档位和指定账号发起手动检测或定时巡检；宿主拥有管理员鉴权、OAuth 凭据、Client Key、模型目录、模型执行、限流与计费。插件只通过宿主回调使用账号与 Key ID，返回本地参考指纹排名和结论，不写账号、路由或计费配置，不把统计排名等同于身份认证。
 
-[清单](../../plugin.json)仅声明 `management v2` 和 `maintenance v1`，运行模式为 `trustedProcess`，不是沙箱。管理资源由宿主提供，不需要独立 Web 服务。插件进程通过 stdin/stdout 与宿主建立 SDK 会话；模型请求只走宿主回调，参考评分只使用包内数据。
+[清单](../../plugin.json)仅声明 `management v2` 和 `maintenance v1`，运行模式为 `trustedProcess`，非沙箱。管理静态资源由宿主托管，无需独立 Web 服务。插件通过 stdin/stdout 建立 SDK 会话，模型请求与目录发现均走宿主回调，指纹评分仅读取包内锁定数据。
 
 ## 模块与依赖
 
 | 模块 | 入口 | 职责与依赖 |
 | --- | --- | --- |
-| 进程入口 | [main.rs](../../src/main.rs)、[清单](../../plugin.json) | 加载包内参考数据和内嵌清单，注册管理与维护回调。数据损坏时管理页仍可用，不发送探针。 |
-| 管理页 | [HTML](../../web/index.html)、[app.js](../../web/app.js) | 通过宿主桥接读取 `GET /catalog`、`GET /runs`、`GET /schedule`；调用 `POST /runs` 和 `PUT /schedule`。展示预计消耗、排队及摘要；浏览器不直接调用模型。 |
-| 管理与维护服务 | [service.rs](../../src/service.rs) | 校验目标、档位、权限和设置；触发状态转换；每次维护调用最多跑一个账号的一轮，对接宿主适配与评分。 |
-| 宿主适配 | [host.rs](../../src/host.rs) | 查询启用账号、启用 Key 和访问权限；执行绑定账号的 Responses 流；提取可见文本；封装状态 CAS。宿主 RPC 变化优先在这里与服务边缘处理。 |
-| 调度与策略 | [domain.rs](../../src/domain.rs)、[state_codec.rs](../../src/state_codec.rs) | 管理有界队列、巡检时间槽、滚动预算、摘要和保守判定。状态转换不依赖网络；编解码有大小上限。 |
-| 离线指纹 | [fingerprint.rs](../../src/fingerprint.rs)、[数据锁](../../data/detector.lock.json)、[档位](../../data/profiles.json) | 校验同版本的 `unified_bank.json` 与 `shared_detector.bin`；使用 `lmfpd` 生成探针、评分并输出参考标签。档位证据绑定请求模型、推理档位和参考库。 |
+| 进程入口 | [main.rs](../../src/main.rs)、[清单](../../plugin.json) | 加载包内锁定参考数据与内嵌清单，声明 600 秒维护阶段预算，注册管理与维护回调。参考数据损坏时管理页仍可读历史但不发送探针。 |
+| 管理页 | [HTML](../../web/index.html)、[CSS](../../web/style.css)、[app.js](../../web/app.js) | 提供「检测与巡检」和「任务记录」两个独立 Tab 页；通过宿主桥接调用 `GET /catalog`、`GET /runs`（带筛选与分页参数）、`POST /runs`、`POST /runs/cancel`、`GET /schedule`、`PUT /schedule`。 |
+| 管理与维护服务 | [service.rs](../../src/service.rs) | 管理模型目录 10 分钟内存缓存（支持 `refresh=1` 强刷）、服务端多维筛选与页码分页、待执行任务取消、手动与定时入队及串行维护调度；维护回调每次最多跑一个账号的一轮探针。 |
+| 宿主适配 | [host.rs](../../src/host.rs) | 经 `host.auth.list` 返回邮箱优先账号目录；经内部管理 `host.http.dispatch`（`/api/admin/accounts/models/catalog`）与 `host.models.list` 自动聚合全部模型及推理档位；执行绑定账号的 `host.model.execute_stream`，正确处理 Responses 稀疏 `content_index`（如 `output_index * 1024 + part_index`）及默认推理档位；封装私有状态 CAS。 |
+| 调度与状态 | [domain.rs](../../src/domain.rs)、[state_codec.rs](../../src/state_codec.rs) | 管理有界队列（≤ 200）、手动幂等键、灵活定时周期（1/6/12/24/48/168 小时，错过不补跑）、摘要历史（≤ 500 条、≤ 30 天）、`v0.1.0-dev.1` 状态向后兼容迁移与有界压缩编解码。 |
+| 离线指纹 | [fingerprint.rs](../../src/fingerprint.rs)、[数据锁](../../data/detector.lock.json) | 启动时校验 `unified_bank.json` 与 `shared_detector.bin` 长度与 SHA-256；通过 `lmfpd` 生成 3 份独立探针并离线评分，支持参考库全量 76 个模型及合并显示名别名匹配，返回 Top-3 候选及概率（bp）。 |
 
 ## 执行流程
 
-1. 管理页列出启用的 OpenAI OAuth 账号和启用的 Client Key，管理员应选专用测试 Key。提交与执行前均检查 Key ID、目标账号及模型访问权。`host.model.execute_stream` 显式传 `provider=openai` 和 `account_id`；不发起未固定账号的替代请求。
-2. 手动单测、批量与定时巡检共用队列：每批 1–10 个账号、每实例最多 30 个任务。巡检默认关闭，间隔可选 24 小时、48 小时、7 天；到期只调度一个时间槽，不补跑错过的周期。每实例滚动 24 小时预算默认 60 次，可降到 3 次。
-3. 维护先以同一个私有状态版本提交认领、时间槽变更和本轮 3 次额度预留，再开始串行调用。CAS 冲突只重试纯状态转换，不重放已经发出的模型调用。重启后仍可领取未发出的任务；已认领但结果未知的记为中断，不自动重跑该轮。预留按最晚发出时刻保守计入窗口，实际消耗可能更少。
-4. 评分只接收三份正常结束的可见文本，拒绝被中间件改写、截断或异常结束的流。已校准档位在首轮目标排名第一且分差达标时判断未发现异常；首轮分差达标而目标掉出前三才用三个新探针复测。只有两轮均达标、同一非目标第一且目标都不在前三才判疑似。校准模式仅显示一轮排名，不给结论。账号版本或评分条件变化、证据不足、执行失败和预算跳过都不等于指纹不符。
+1. **目录与模型发现**：管理页请求 `GET /catalog` 时，插件读取启用的 OpenAI OAuth 账号（优先展示真实 `email`，附带 `name`、`planType` 与 `accountId`）和启用的 Client Key，再选取最多 3 个不同订阅套餐的代表账号通过内部 `host.http.dispatch` 拉取原生 Codex 模型目录，合并全部模型及各自 `supported_reasoning_levels`，并结合 `host.models.list` 补齐额外模型，结果内存缓存 10 分钟并支持手动强刷。
+2. **手动检测与定时巡检**：手动单批支持 1–100 个账号；定时巡检默认关闭，开启后按设定周期每次仅调度当前时间槽，不补跑历史积压。两者共用有界队列（上限 200），按 `(account_id, model, effort)` 去重，且无 24 小时探针预算或校准模式限制。待执行任务可通过 `POST /runs/cancel` 取消。
+3. **串行执行与中断安全**：维护回调先通过私有状态 CAS 清理过期项、恢复异常中断的遗留认领、触发到期定时入队并认领下一项任务，再执行该账号本轮 3 次串行模型调用。调用前与调用后均核验账号启用状态与 `credential_revision`，并校验 Client Key 权限；`host.model.execute_stream` 显式绑定 `provider=openai` 与 `account_id`，不回落其他账号。若进程重启导致已认领任务结果未知，标记为 `interrupted / restarted` 不自动重发。
+4. **流解析与指纹判定**：流式解析仅收集正常结束（`FinishReason::Stop`）的可见文本，按不同分片数量（≤ 32）而非原始索引值做有界限制，兼容推理模型 `output_index >= 1`（`content_index = 1024, 2048...`），拒绝被截断、拒绝回答或被中间件改写的流。
+   - 若被测模型在本地 76 模型参考库内：首轮目标排名第 1 且头两名分差 > 0 判 `match`（指纹匹配）；目标位于第 2/3 或平分判 `insufficient / nearby`；目标掉出前三则自动用 3 个新探针执行第 2 轮复测，两轮均掉出前三且第一名为同一非目标标签判 `suspect`（疑似指纹异常），否则判 `insufficient / inconsistent`。
+   - 若被测模型未收录于当前参考库：一轮 3 次探针后返回 `ranked`（参考排名），展示 Top-3 最接近参考模型及概率分布。
 
 ## 持久化与恢复边界
 
-- 插件在宿主中仅持有单一私有状态键 `iq-test / state`（`schemaVersion: 1`，由 [state_codec.rs](../../src/state_codec.rs) 做 zlib+Base64 压缩编解码、由 [host.rs](../../src/host.rs) 以 CAS 原子提交），用于保存巡检设置、有界队列、手动幂等键、滚动预算预留与摘要历史；不存探针正文、原始回复、OAuth 凭据或 Client Key 明文。
-- 插件不提供独立导出、备份或恢复命令；宿主凭据与数据库备份属于宿主职责，参考数据锁与兼容表按版本控制和发布流程保留。
-- 完整的配额上限、各类数据备份覆盖、版本切换/重启/删除实例/schema 迁移影响与对应证据统一维护在[持久化与备份边界](PERSISTENCE.md)，不在此重复展开。
+- 插件在宿主中仅持有单一私有状态键 `iq-test / state`（`schemaVersion: 1`，由 [state_codec.rs](../../src/state_codec.rs) 做 zlib+Base64 有界压缩、由 [host.rs](../../src/host.rs) 以 CAS 提交），保存定时计划、排队任务、手动幂等键与摘要历史（含账号邮箱/名称快照）；不存探针正文、原始回复、OAuth 凭据或 Client Key 明文。
+- 向后兼容 `v0.1.0-dev.1` 状态文档（自动忽略已移除的 `probeBudget`/`reservations`，将旧 `profileId`/`calibration` 迁移为 `model`/`effort`/`ranked`）。完整配额、备份覆盖与操作影响见[持久化与备份边界](PERSISTENCE.md)。
 
 ## 构建、测试与交付
 
-- [Cargo.toml](../../Cargo.toml)、[rust-toolchain.toml](../../rust-toolchain.toml)定义 Rust 构建入口及工具链；[detector_assets.py](../../scripts/detector_assets.py)校验参考数据，[package.py](../../scripts/package.py)用指定宿主提交的 `cpr-plugin` 产出目标平台包和 SHA-256。
-- Rust 测试覆盖绑定、流解析、状态和离线判定；[Python 回归](../../tests/test_release.py)覆盖跟版决策；[check_bound_host.sh](../../scripts/check_bound_host.sh)检查宿主不轮换绑定账号的契约，[smoke_host.py](../../scripts/smoke_host.py)用真实隔离宿主验证安装、运行及状态切换。操作和回退步骤以[验证、跟版与回滚](../release.md)为准。
-- [正式版跟版](../../.github/workflows/follow-host.yml)先做版本与契约发现，仅在有旧包时运行旧包矩阵，缺证据或契约不符时在三平台重建前提前阻断；支持 `preflight` 只读预检、`dry_run` 演练、转正式前远端附件大小/SHA-256 核验、阶段回执（`publish-receipt.json`）及同提交 `resume_run_id` 断点续跑。发现与发布闸门在 [follow_host.py](../../scripts/follow_host.py) 和 [release_gate.py](../../scripts/release_gate.py)。[main 预警](../../.github/workflows/host-main.yml)不发包；[常规检查](../../.github/workflows/checks.yml)独立运行。三份工作流均使用 Cargo 与参考数据缓存加速（仍以锁文件与 SHA-256 校验为准）。生产安装与切换始终由管理员确认。
+- [Cargo.toml](../../Cargo.toml)、[rust-toolchain.toml](../../rust-toolchain.toml) 定义 Rust 工具链与依赖；[detector_assets.py](../../scripts/detector_assets.py) 校验参考数据；[package.py](../../scripts/package.py) 调用锁定宿主提交的 `cpr-plugin` 产出平台安装包与 SHA-256。
+- Rust 单测覆盖绑定账号、稀疏 `content_index`、默认推理档位、模型目录合并、邮箱展示、筛选分页、旧版状态迁移与离线两轮判定；[Python 回归](../../tests/test_release.py)覆盖跟版决策；[check_bound_host.sh](../../scripts/check_bound_host.sh)验证宿主 Core 不轮换契约；[smoke_host.py](../../scripts/smoke_host.py)在隔离真实宿主上验证安装、双 Tab 资源、目录、筛选分页、旧版迁移切换与重启。
+- [正式版跟版](../../.github/workflows/follow-host.yml)通过 [follow_host.py](../../scripts/follow_host.py) 和 [release_gate.py](../../scripts/release_gate.py) 执行契约核验、旧包复用/三平台重建、隔离 smoke、`prerelease` 预览、远端附件摘要核验及 `resume_run_id` 断点续跑。[main 预警](../../.github/workflows/host-main.yml)仅预警不发包；[常规检查](../../.github/workflows/checks.yml)独立运行。

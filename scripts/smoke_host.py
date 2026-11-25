@@ -164,25 +164,55 @@ def prefix_for(ext):
     return f'/api/admin/plugins/extensions/{target["instanceId"]}/{target["artifactSha256"]}/{target["revision"]}'
 
 
-def seed_history(sql, instance_id, budget):
+def seed_history(sql, instance_id, hours):
     # A DB fixture is applied only to this newly initialized smoke database, never to a deployment.
     uuid.UUID(instance_id)
     scope = f"g.instance_id='{instance_id}' AND g.namespace='iq-test' AND g.status='active'"
     raw = sql(f"SELECT r.value_json->>'document' FROM plugin_state_records r JOIN plugin_state_generations g ON r.generation_id=g.id WHERE {scope};")
     state = json.loads(zlib.decompress(base64.b64decode(raw)))
-    assert not state["queue"] and state["settings"]["probeBudget"] == budget
-    history = {
-        "runId": "m-smokefixture", "accountId": "fixture-account-no-upstream", "profileId": "fixture-profile",
-        "mode": "detect", "scheduled": False, "endedAt": int(time.time() * 1000), "pluginVersion": "fixture",
-        "firstRound": None, "outcome": {"verdict": "interrupted", "reason": "restarted", "lastRound": None},
+    assert not state["queue"] and state["settings"]["hours"] == hours
+    now_ms = int(time.time() * 1000)
+    # Seed both a new-format entry with real email and a legacy v0.1.0-dev.1 profileId/calibration entry.
+    modern = {
+        "runId": "m-smokemodern",
+        "accountId": "acct_smoke_modern",
+        "accountEmail": "smoke@example.com",
+        "accountName": "Smoke Account",
+        "model": "gpt-6.2-sol",
+        "effort": "high",
+        "scheduled": False,
+        "endedAt": now_ms,
+        "pluginVersion": "fixture",
+        "firstRound": None,
+        "outcome": {
+            "verdict": "match",
+            "reason": None,
+            "lastRound": {
+                "ranking": {"candidates": [{"id": "gpt-6.2-sol", "label": "gpt-6.2-sol", "probabilityBps": 9100}]},
+                "stamp": "smoke-stamp",
+                "detectorRevision": "fixture",
+                "topMarginBps": 8200,
+            },
+        },
     }
-    state["history"] = [history]
+    legacy = {
+        "runId": "m-smokelegacy",
+        "accountId": "acct_smoke_legacy",
+        "profileId": "gpt6-sol-low",
+        "mode": "calibration",
+        "scheduled": True,
+        "endedAt": now_ms - 1000,
+        "pluginVersion": "0.1.0-dev.1",
+        "firstRound": None,
+        "outcome": {"verdict": "calibration", "reason": None, "lastRound": None},
+    }
+    state["history"] = [modern, legacy]
     value = json.dumps({"document": base64.b64encode(zlib.compress(json.dumps(state).encode())).decode()}, separators=(",", ":"))
     # Value contains only base64 and fixed JSON syntax; instance ID is a verified UUID.
     sql(f"BEGIN; UPDATE plugin_state_records r SET value_json='{value}'::jsonb, value_bytes={len(value)}"
         f" FROM plugin_state_generations g WHERE g.id=r.generation_id AND {scope};"
         f" UPDATE plugin_state_generations g SET total_bytes={len(value)} WHERE {scope}; COMMIT;")
-    return history
+    return modern, legacy
 
 
 def smoke(args):
@@ -227,6 +257,15 @@ def smoke(args):
             timed_wait("host health", health)
             api.call("POST", "/api/auth/login", {"mode": "admin", "username": username, "password": admin_password})
 
+        def verify_seeded_runs(url):
+            all_runs = api.call("GET", url + "/api/runs?page=1&pageSize=10")
+            assert all_runs["pagination"]["total"] == 2 and len(all_runs["items"]) == 2, all_runs
+            filtered = api.call("GET", url + "/api/runs?search=smoke%40example.com&source=manual&verdict=match&page=1&pageSize=1")
+            assert filtered["pagination"]["total"] == 1 and filtered["items"][0]["accountEmail"] == "smoke@example.com", filtered
+            migrated = api.call("GET", url + "/api/runs?source=scheduled&verdict=ranked")
+            assert migrated["pagination"]["total"] == 1, migrated
+            assert migrated["items"][0]["model"] == "gpt-6-sol" and migrated["items"][0]["effort"] == "low", migrated
+
         try:
             login()
             base_digest = upload(api, args.baseline or args.package)
@@ -234,23 +273,25 @@ def smoke(args):
             base_target = ext["target"]
             base_url = prefix_for(ext)
             assert any(page["entry"] == "web/index.html" for page in ext["pages"])
-            assert b"app.js" in api.call("GET", base_url + "/resources/web/index.html")
+            html = api.call("GET", base_url + "/resources/web/index.html")
+            assert b"app.js" in html and b"tab-records" in html
             assert api.call("GET", base_url + "/resources/web/app.js")
             assert api.call("GET", base_url + "/resources/web/style.css")
             catalog = api.call("GET", base_url + "/api/catalog")
-            assert catalog["detectorReady"] and not catalog["accounts"] and not catalog["keys"], catalog
-            assert set(args.required_profile) <= {p["id"] for p in catalog["profiles"] if p["validated"]}, catalog
-            assert not api.call("GET", base_url + "/api/runs")["history"]
+            assert catalog["detectorReady"] and not catalog["accounts"] and not catalog["keys"] and catalog["models"] == [], catalog
+            runs = api.call("GET", base_url + "/api/runs?page=1&pageSize=20")
+            assert not runs["items"] and runs["pagination"]["total"] == 0, runs
+            assert api.call("POST", base_url + "/api/runs/cancel", {}) == {"cancelled": 0}
             default = api.call("GET", base_url + "/api/schedule")["settings"]
-            assert default == {"enabled": False, "hours": 24, "probeBudget": 60, "target": None}, default
-            settings = {**default, "probeBudget": 39, "hours": 48}
+            assert default == {"enabled": False, "hours": 24, "target": None}, default
+            settings = {**default, "hours": 12}
             edited = api.call("PUT", base_url + "/api/schedule", {"settings": settings, "previous": default})
             assert edited["settings"] == settings and edited["nextDueAt"] is None
-            api.call("POST", base_url + "/api/runs", {"mode": "detect", "runId": "m-invalidsmoke", "target": {
-                "clientKeyId": "key-fixture", "profileId": "not-a-profile", "accountIds": ["no-account"]}}, expected=422)
+            api.call("POST", base_url + "/api/runs", {"runId": "m-invalidsmoke", "target": {
+                "clientKeyId": "key-fixture", "model": "", "effort": "low", "accountIds": ["no-account"]}}, expected=400)
             if args.baseline:
-                expected_history = [seed_history(sql, base_target["instanceId"], 39)]
-                assert api.call("GET", base_url + "/api/runs")["history"] == expected_history
+                seed_history(sql, base_target["instanceId"], 12)
+                verify_seeded_runs(base_url)
                 digest = upload(api, args.package)
                 api.call("POST", "/api/admin/plugins/instances/switch-version", {"id": base_target["instanceId"],
                     "target": {"artifactSha256": digest, "expectedRevision": base_target["revision"]}})
@@ -259,16 +300,15 @@ def smoke(args):
                 new_url = prefix_for(ext)
                 candidate_catalog = api.call("GET", new_url + "/api/catalog")
                 assert candidate_catalog["detectorReady"]
-                assert set(args.required_profile) <= {p["id"] for p in candidate_catalog["profiles"] if p["validated"]}
                 assert api.call("GET", new_url + "/api/schedule")["settings"] == settings
-                assert api.call("GET", new_url + "/api/runs")["history"] == expected_history
+                verify_seeded_runs(new_url)
                 stop(host)
                 host = launch(stack, log, [str(bin_path)], cwd=root, env=env)
                 login()
                 ext = timed_wait("management registration after restart", lambda: extension(api, digest), 22)
                 now_url = prefix_for(ext)
                 assert api.call("GET", now_url + "/api/schedule")["settings"] == settings
-                assert api.call("GET", now_url + "/api/runs")["history"] == expected_history
+                verify_seeded_runs(now_url)
             print(f"Smoke OK: {args.host_tag}, {args.package.name}; no upstream account or model was called")
         finally:
             if args.log:
@@ -285,7 +325,6 @@ def main():
     p.add_argument("--host-sha", required=True)
     p.add_argument("--package", type=pathlib.Path, required=True)
     p.add_argument("--baseline", type=pathlib.Path)
-    p.add_argument("--required-profile", action="append", default=[])
     p.add_argument("--docker-services", action="store_true")
     p.add_argument("--log", type=pathlib.Path)
     args = p.parse_args()

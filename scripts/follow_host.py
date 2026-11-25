@@ -34,6 +34,7 @@ SHA = re.compile(r"[a-f0-9]{40}\Z")
 DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 CALLBACKS = {
     "host.auth.list", "host.auth.get_runtime", "host.keys.list", "host.data.access.check",
+    "host.models.list", "host.http.dispatch", "host.http.body_read", "host.http.body_close",
     "host.model.execute_stream", "host.model.stream_read", "host.model.stream_close",
     "host.state.get", "host.state.put", "plugin.reconcile", "management.handle", "management.register",
 }

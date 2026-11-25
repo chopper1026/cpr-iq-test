@@ -64,7 +64,6 @@
       ".tidy.json",
       "plugin.json",
       "data/detector.lock.json",
-      "data/profiles.json",
       "tests/known_other.json"
     ],
     "toml": [
@@ -115,10 +114,6 @@
       {
         "document": "THIRD_PARTY.md",
         "target": "Cargo.lock"
-      },
-      {
-        "document": "docs/release.md",
-        "target": "data/profiles.json"
       },
       {
         "document": "docs/release.md",
@@ -198,24 +193,6 @@
       }
     ],
     "registries": [
-      {
-        "document": "docs/release.md",
-        "registry": "data/profiles.json",
-        "pointer": "",
-        "field": "id",
-        "names": [
-          "gpt6-sol-low"
-        ]
-      },
-      {
-        "document": "docs/development/FEATURES.md",
-        "registry": "data/profiles.json",
-        "pointer": "",
-        "field": "id",
-        "names": [
-          "gpt6-sol-low"
-        ]
-      },
       {
         "document": "docs/development/ARCHITECTURE.md",
         "registry": "data/detector.lock.json",

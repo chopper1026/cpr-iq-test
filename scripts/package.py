@@ -39,7 +39,7 @@ def stage_source(project, sdk_commit):
     shutil.copytree(ROOT / "src", project / "src")
     shutil.copytree(ROOT / "tests", project / "tests", ignore=shutil.ignore_patterns("__pycache__"))
     (project / "data").mkdir()
-    for item in ("detector.lock.json", "profiles.json", "shared_detector.bin", "unified_bank.json"):
+    for item in ("detector.lock.json", "shared_detector.bin", "unified_bank.json"):
         shutil.copy2(ROOT / "data" / item, project / "data" / item)
     file = project / "Cargo.toml"
     old = tomllib.loads(file.read_text())["dependencies"]["gateway-plugin-sdk"]["rev"]

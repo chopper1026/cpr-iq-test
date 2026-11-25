@@ -1,8 +1,10 @@
 //! Management handlers and the single maintenance worker share the same persisted queue.
 use crate::{
-    domain::{self, Decision, Mode, Outcome, Reason, Settings, State, Target, Task, Verdict},
+    domain::{
+        self, AccountMeta, Decision, Outcome, Reason, Round, Settings, State, Target, Task, Verdict,
+    },
     fingerprint::Fingerprint,
-    host::{Host, safe_reason},
+    host::{AccountChoice, DiscoveredModel, Host, safe_reason},
 };
 use gateway_plugin_sdk::{
     PluginFault,
@@ -12,13 +14,17 @@ use gateway_plugin_sdk::{
     },
     client::{Empty, TypedCall, TypedReply},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::{Mutex, RwLock};
 
 const JSON: &str = "application/json";
-const MAX_REQUEST: usize = 8 * 1024;
+const MAX_REQUEST: usize = 32 * 1024;
+const MODEL_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
 
 type Reply = TypedReply<ManagementResponse>;
 
@@ -38,6 +44,7 @@ pub fn registration() -> ManagementRegistration {
             route("GET", "catalog"),
             route("GET", "runs"),
             route("POST", "runs"),
+            route("POST", "runs/cancel"),
             route("GET", "schedule"),
             route("PUT", "schedule"),
         ],
@@ -51,7 +58,7 @@ pub fn registration() -> ManagementRegistration {
         pages: vec![ManagementPage {
             id: "fingerprint".into(),
             title: "账号指纹巡检".into(),
-            description: Some("按指定 Codex 账号比较模型参考指纹".into()),
+            description: Some("对指定 Codex 账号执行手动与定时模型指纹检测".into()),
             entry: "web/index.html".into(),
             icon: None,
         }],
@@ -61,18 +68,113 @@ pub fn registration() -> ManagementRegistration {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TargetInput {
+    client_key_id: String,
+    model: String,
+    effort: String,
+    account_ids: Vec<String>,
+}
+
+impl TargetInput {
+    fn into_target(self) -> Result<Target, Reason> {
+        let mut target = Target::new(
+            self.client_key_id,
+            self.model,
+            self.effort,
+            self.account_ids,
+        );
+        target.normalize()?;
+        Ok(target)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Submit {
     run_id: String,
-    target: Target,
+    target: TargetInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancelRequest {
     #[serde(default)]
-    mode: Mode,
+    run_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SettingsInput {
+    enabled: bool,
+    hours: u16,
+    target: Option<TargetInput>,
+}
+
+impl SettingsInput {
+    fn into_settings(self) -> Result<Settings, Reason> {
+        let target = self.target.map(TargetInput::into_target).transpose()?;
+        let mut settings = Settings {
+            enabled: self.enabled,
+            hours: self.hours,
+            target,
+        };
+        settings.normalize()?;
+        Ok(settings)
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditSchedule {
-    settings: Settings,
-    previous: Settings,
+    settings: SettingsInput,
+    previous: SettingsInput,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelView {
+    id: String,
+    display_name: String,
+    efforts: Vec<String>,
+    default_effort: String,
+    in_reference_bank: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_label: Option<String>,
+}
+
+#[derive(Clone)]
+struct CachedModels {
+    fetched_at: u64,
+    key_scope: Option<String>,
+    models: Vec<DiscoveredModel>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunRecord {
+    kind: &'static str,
+    run_id: String,
+    account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_name: Option<String>,
+    model: String,
+    effort: String,
+    scheduled: bool,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin_version: Option<String>,
+    first_round: Option<Round>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<Outcome>,
 }
 
 #[derive(Debug)]
@@ -85,7 +187,7 @@ impl From<Reason> for HttpError {
                 Reason::InvalidInput => 400,
                 Reason::AccessDenied => 403,
                 Reason::Conflict | Reason::QueueFull => 409,
-                Reason::Budget | Reason::RateLimited => 429,
+                Reason::RateLimited => 429,
                 Reason::UnsupportedProfile | Reason::AccountUnavailable => 422,
                 Reason::Timeout => 504,
                 _ => 503,
@@ -99,6 +201,7 @@ pub struct Service {
     version: String,
     bank: Option<Fingerprint>,
     maintenance: Mutex<()>,
+    model_cache: RwLock<Option<CachedModels>>,
 }
 
 impl Service {
@@ -107,6 +210,7 @@ impl Service {
             version,
             bank,
             maintenance: Mutex::new(()),
+            model_cache: RwLock::new(None),
         }
     }
 
@@ -129,99 +233,204 @@ impl Service {
         .with_payload(data.to_string().into_bytes()))
     }
 
+    async fn resolve_models(
+        &self,
+        host: &Host<'_>,
+        accounts: &[AccountChoice],
+        keys: &[crate::host::Choice],
+        preferred_key: Option<&str>,
+        force_refresh: bool,
+    ) -> (Vec<ModelView>, Option<u64>, Option<String>) {
+        let key_scope = preferred_key
+            .filter(|id| keys.iter().any(|k| k.id == *id))
+            .or_else(|| keys.first().map(|k| k.id.as_str()))
+            .map(str::to_owned);
+        let at = now();
+        if !force_refresh {
+            let cached = self.model_cache.read().await;
+            if let Some(entry) = cached.as_ref()
+                && at.saturating_sub(entry.fetched_at) < MODEL_CACHE_TTL_MS
+                && entry.key_scope == key_scope
+                && (!entry.models.is_empty() || accounts.is_empty())
+            {
+                return (
+                    self.annotate_models(&entry.models),
+                    Some(entry.fetched_at),
+                    entry.error.clone(),
+                );
+            }
+        }
+        let (models, error) = host
+            .discover_models(accounts, keys, key_scope.as_deref())
+            .await;
+        let fetched_at = now();
+        let views = self.annotate_models(&models);
+        *self.model_cache.write().await = Some(CachedModels {
+            fetched_at,
+            key_scope,
+            models,
+            error: error.clone(),
+        });
+        (views, Some(fetched_at), error)
+    }
+
+    fn annotate_models(&self, models: &[DiscoveredModel]) -> Vec<ModelView> {
+        models
+            .iter()
+            .map(|m| {
+                let reference = self.bank.as_ref().and_then(|b| b.expected_label(&m.id));
+                ModelView {
+                    id: m.id.clone(),
+                    display_name: m.display_name.clone(),
+                    efforts: m.efforts.clone(),
+                    default_effort: m.default_effort.clone(),
+                    in_reference_bank: reference.is_some(),
+                    reference_label: reference.map(|(_, display)| display.to_owned()),
+                }
+            })
+            .collect()
+    }
+
     async fn route(
         &self,
         host: &Host<'_>,
         request: &ManagementRequest,
         payload: &[u8],
     ) -> Result<(u16, Value), HttpError> {
-        if !request.query.is_empty() || payload.len() > MAX_REQUEST {
+        if payload.len() > MAX_REQUEST || request.query.len() > 2048 {
             return Err(Reason::InvalidInput.into());
         }
+        let query = parse_query(&request.query);
         let path = request.path.as_str();
         match (request.method.as_str(), path) {
             ("GET", "catalog") => {
+                let force_refresh = query
+                    .get("refresh")
+                    .is_some_and(|v| matches!(v.as_str(), "1" | "true"));
+                let preferred_key = query
+                    .get("clientKeyId")
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty());
                 let (accounts, keys) = host.catalog().await?;
+                let (models, model_catalog_at, model_catalog_error) = self
+                    .resolve_models(host, &accounts, &keys, preferred_key, force_refresh)
+                    .await;
                 Ok((
                     200,
-                    json!({"accounts":accounts,"keys":keys,"detectorReady":self.bank.is_some(),
-                    "detectorRevision":self.bank.as_ref().map(|b| &b.revision), "pluginVersion":self.version,
-                    "profiles":self.bank.as_ref().map(Fingerprint::options).unwrap_or_default(), "maxBatch":domain::MAX_BATCH}),
+                    json!({
+                        "accounts": accounts,
+                        "keys": keys,
+                        "models": models,
+                        "modelCatalogAt": model_catalog_at,
+                        "modelCatalogError": model_catalog_error,
+                        "detectorReady": self.bank.is_some(),
+                        "detectorRevision": self.bank.as_ref().map(|b| &b.revision),
+                        "pluginVersion": self.version,
+                        "maxBatch": domain::MAX_BATCH,
+                    }),
                 ))
             }
             ("GET", "runs") => {
                 let (mut state, _) = host.load().await.map_err(|e| safe_reason(&e))?;
                 state.prune(now());
-                let queue: Vec<_> = state.queue.iter().map(|q| json!({"runId":q.run_id,"accountId":q.account_id,
-                    "profileId":q.profile_id,"mode":q.mode,"scheduled":q.scheduled,"queuedAt":q.queued_at,
-                    "running":q.claimed,"round": if q.first_round.is_some() {2} else {1}})).collect();
-                Ok((
-                    200,
-                    json!({"queue":queue,"history":state.history,"remaining":state.remaining(),"budget":state.settings.probe_budget}),
-                ))
+                let params = RunQuery::from_map(&query)?;
+                let needs_labels = state.queue.iter().any(|q| q.account_email.is_none())
+                    || state.history.iter().any(|h| h.account_email.is_none());
+                let live_labels = if needs_labels {
+                    account_labels(host).await
+                } else {
+                    BTreeMap::new()
+                };
+                Ok((200, build_runs_response(&state, &params, &live_labels)))
             }
             ("GET", "schedule") => {
+                if !request.query.is_empty() {
+                    return Err(Reason::InvalidInput.into());
+                }
                 let (state, _) = host.load().await.map_err(|e| safe_reason(&e))?;
                 Ok((200, schedule_value(&state)))
             }
             ("POST", "runs") => {
-                let mut submit: Submit = parse(payload)?;
-                submit.target.normalize()?;
-                let model = &self
+                if !request.query.is_empty() {
+                    return Err(Reason::InvalidInput.into());
+                }
+                if self.bank.is_none() {
+                    return Err(Reason::DetectorUnavailable.into());
+                }
+                let submit: Submit = parse(payload)?;
+                let target = submit.target.into_target()?;
+                host.access(&target.client_key_id, &target.account_ids, &target.model)
+                    .await?;
+                let labels = account_labels(host).await;
+                let expected_in_bank = self
                     .bank
                     .as_ref()
-                    .ok_or(Reason::DetectorUnavailable)?
-                    .profile(&submit.target.profile_id, submit.mode)?
-                    .model;
-                host.access(
-                    &submit.target.client_key_id,
-                    &submit.target.account_ids,
-                    model,
-                )
-                .await?;
+                    .and_then(|b| b.expected_label(&target.model))
+                    .is_some();
+                let count = target.account_ids.len();
                 let at = now();
                 let result = host
                     .change(|state, _| {
                         state.prune(at);
-                        state.enqueue_manual(
-                            submit.run_id.clone(),
-                            submit.target.clone(),
-                            submit.mode,
-                            at,
-                        )
+                        state.enqueue_manual(submit.run_id.clone(), target.clone(), at, &labels)
                     })
                     .await
                     .map_err(|e| safe_reason(&e))?;
                 result?;
-                let base = submit.target.account_ids.len() * domain::PROBES_PER_ROUND as usize;
+                let base = count * domain::PROBES_PER_ROUND as usize;
                 Ok((
                     202,
-                    json!({"runId":submit.run_id,"probesMin":base,"probesMax":if submit.mode == Mode::Detect {2*base} else {base}}),
+                    json!({
+                        "runId": submit.run_id,
+                        "queuedCount": count,
+                        "probesMin": base,
+                        "probesMax": if expected_in_bank { 2 * base } else { base },
+                    }),
                 ))
             }
+            ("POST", "runs/cancel") => {
+                if !request.query.is_empty() {
+                    return Err(Reason::InvalidInput.into());
+                }
+                let cancel: CancelRequest = if payload.is_empty() {
+                    CancelRequest { run_id: None }
+                } else {
+                    parse(payload)?
+                };
+                if let Some(id) = &cancel.run_id
+                    && !domain::valid_id(id, 64)
+                {
+                    return Err(Reason::InvalidInput.into());
+                }
+                let cancelled = host
+                    .change(|state, _| state.cancel_pending(cancel.run_id.as_deref()))
+                    .await
+                    .map_err(|e| safe_reason(&e))?;
+                Ok((200, json!({"cancelled": cancelled})))
+            }
             ("PUT", "schedule") => {
-                let mut edit: EditSchedule = parse(payload)?;
-                edit.settings.normalize()?;
-                edit.previous.normalize()?;
-                if edit.settings.enabled {
-                    let target = edit.settings.target.as_ref().ok_or(Reason::InvalidInput)?;
-                    let model = &self
-                        .bank
-                        .as_ref()
-                        .ok_or(Reason::DetectorUnavailable)?
-                        .profile(&target.profile_id, Mode::Detect)?
-                        .model;
-                    host.access(&target.client_key_id, &target.account_ids, model)
+                if !request.query.is_empty() {
+                    return Err(Reason::InvalidInput.into());
+                }
+                let edit: EditSchedule = parse(payload)?;
+                let settings = edit.settings.into_settings()?;
+                let previous = edit.previous.into_settings()?;
+                if settings.enabled {
+                    if self.bank.is_none() {
+                        return Err(Reason::DetectorUnavailable.into());
+                    }
+                    let target = settings.target.as_ref().ok_or(Reason::InvalidInput)?;
+                    host.access(&target.client_key_id, &target.account_ids, &target.model)
                         .await?;
                 }
                 let at = now();
                 let value = host
                     .change(|state, _| {
-                        if state.settings != edit.previous && state.settings != edit.settings {
+                        if state.settings != previous && state.settings != settings {
                             return Err(Reason::Conflict);
                         }
                         state.prune(at);
-                        state.schedule(edit.settings.clone(), at, &self.version);
+                        state.schedule(settings.clone(), at, &self.version);
                         Ok(schedule_value(state))
                     })
                     .await
@@ -241,86 +450,416 @@ impl Service {
         };
         let host = Host(&call.host);
         let at = now();
+        let (preview, _) = host.load().await?;
+        let labels = if preview.is_schedule_due(at) {
+            account_labels(&host).await
+        } else {
+            BTreeMap::new()
+        };
         let task = host
             .change(|state, _| {
                 state.prune(at);
                 // An earlier committed claim still present after its maintenance scope ended is never replayed.
                 state.recover(at, &self.version);
-                state.schedule_due(at, &self.version);
-                state.claim(at, &self.version)
+                state.schedule_due(at, &self.version, &labels);
+                state.claim()
             })
             .await?;
         if let Some(task) = task {
-            let result = tokio::select! {
+            let (result, refreshed_meta) = tokio::select! {
                 biased;
-                () = call.cancellation.cancelled() => Decision::Finish(failure(Reason::Cancelled)),
-                result = self.run_round(&host, &task) => result,
+                () = call.cancellation.cancelled() => (Decision::Finish(failure(Reason::Cancelled)), None),
+                output = self.run_round(&host, &task) => output,
             };
             // CAS may retry this *settlement*, but never rerun a model request.
             let at = now();
-            host.change(|state, _| state.complete(&task, result.clone(), at, &self.version))
-                .await?;
+            host.change(|state, _| {
+                state.complete(
+                    &task,
+                    result.clone(),
+                    at,
+                    &self.version,
+                    refreshed_meta.clone(),
+                );
+            })
+            .await?;
         }
         Ok(TypedReply::new(Empty {}))
     }
 
-    async fn run_round(&self, host: &Host<'_>, task: &Task) -> Decision {
+    async fn run_round(&self, host: &Host<'_>, task: &Task) -> (Decision, Option<AccountMeta>) {
         match self.try_round(host, task).await {
-            Ok(result) => result,
-            Err(error) => Decision::Finish(failure(error)),
+            Ok((result, meta)) => (result, meta),
+            Err((error, meta)) => (Decision::Finish(failure(error)), meta),
         }
     }
 
-    async fn try_round(&self, host: &Host<'_>, task: &Task) -> Result<Decision, Reason> {
-        let bank = self.bank.as_ref().ok_or(Reason::DetectorUnavailable)?;
-        let p = bank.profile(&task.profile_id, task.mode)?;
-        let revision = host.account_revision(&task.account_id).await?;
-        let stamp = p.round_stamp(revision);
+    async fn try_round(
+        &self,
+        host: &Host<'_>,
+        task: &Task,
+    ) -> Result<(Decision, Option<AccountMeta>), (Reason, Option<AccountMeta>)> {
+        let bank = self
+            .bank
+            .as_ref()
+            .ok_or((Reason::DetectorUnavailable, None))?;
+        let info = host
+            .account_info(&task.account_id)
+            .await
+            .map_err(|e| (e, None))?;
+        let meta = Some(info.meta);
+        let stamp = bank.round_stamp(&task.model, &task.effort, info.credential_revision);
         if task.first_round.as_ref().is_some_and(|r| r.stamp != stamp) {
-            return Err(Reason::VersionChanged);
+            return Err((Reason::VersionChanged, meta));
         }
         host.access(
             &task.client_key_id,
             std::slice::from_ref(&task.account_id),
-            &p.model,
+            &task.model,
         )
-        .await?;
+        .await
+        .map_err(|e| (e, meta.clone()))?;
+        let challenges = bank.challenges().map_err(|e| (e, meta.clone()))?;
         let mut outputs = Vec::with_capacity(domain::PROBES_PER_ROUND as usize);
-        for c in bank.challenges()? {
+        for c in challenges {
             let text = host
                 .sample(
                     &task.client_key_id,
                     &task.account_id,
-                    &p.model,
-                    &p.effort,
+                    &task.model,
+                    &task.effort,
                     &c.prompt,
                 )
-                .await?;
+                .await
+                .map_err(|e| (e, meta.clone()))?;
             outputs.push(lmfpd::Output {
                 text,
                 expected_count: c.expected_count,
             });
         }
-        if host.account_revision(&task.account_id).await? != revision {
-            return Err(Reason::AccountChanged);
+        let after = host
+            .account_info(&task.account_id)
+            .await
+            .map_err(|e| (e, meta.clone()))?;
+        if after.credential_revision != info.credential_revision {
+            return Err((Reason::AccountChanged, Some(after.meta)));
         }
-        let round = bank.rank(&outputs, stamp)?;
-        if task.mode == Mode::Detect
-            && p.minimum_margin()
-                .is_none_or(|threshold| round.top_margin_bps < threshold)
-        {
-            return Ok(Decision::Finish(Outcome {
-                verdict: Verdict::Insufficient,
-                reason: Some(Reason::Nearby),
-                last_round: Some(round),
-            }));
-        }
-        Ok(domain::decide(
-            task.mode,
-            &p.label_id,
-            task.first_round.as_ref(),
-            round,
+        let round = bank
+            .rank(&outputs, stamp)
+            .map_err(|e| (e, Some(after.meta.clone())))?;
+        let expected = bank.expected_label(&task.model).map(|(id, _)| id);
+        Ok((
+            domain::decide(expected, task.first_round.as_ref(), round),
+            Some(after.meta),
         ))
+    }
+}
+
+async fn account_labels(host: &Host<'_>) -> BTreeMap<String, AccountMeta> {
+    host.accounts()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|account| {
+            let meta = account.meta();
+            (account.id, meta)
+        })
+        .collect()
+}
+
+struct RunQuery {
+    page: usize,
+    page_size: usize,
+    search: Option<String>,
+    source: Option<bool>,
+    verdict: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    account_id: Option<String>,
+}
+
+impl RunQuery {
+    fn from_map(map: &BTreeMap<String, String>) -> Result<Self, Reason> {
+        let page = match map.get("page").filter(|s| !s.is_empty()) {
+            Some(raw) => raw.parse::<usize>().map_err(|_| Reason::InvalidInput)?,
+            None => 1,
+        };
+        let page_size = match map.get("pageSize").filter(|s| !s.is_empty()) {
+            Some(raw) => raw.parse::<usize>().map_err(|_| Reason::InvalidInput)?,
+            None => 20,
+        };
+        if page == 0 || !(1..=100).contains(&page_size) {
+            return Err(Reason::InvalidInput);
+        }
+        let source = match map.get("source").map(String::as_str) {
+            None | Some("" | "all") => None,
+            Some("manual") => Some(false),
+            Some("scheduled") => Some(true),
+            Some(_) => return Err(Reason::InvalidInput),
+        };
+        let clean = |key: &str| {
+            map.get(key)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty() && v != "all")
+        };
+        Ok(Self {
+            page,
+            page_size,
+            search: clean("search").map(|s| s.to_ascii_lowercase()),
+            source,
+            verdict: clean("verdict").map(|s| s.to_ascii_lowercase()),
+            model: clean("model"),
+            effort: clean("effort"),
+            account_id: clean("accountId"),
+        })
+    }
+}
+
+fn build_runs_response(
+    state: &State,
+    query: &RunQuery,
+    live_labels: &BTreeMap<String, AccountMeta>,
+) -> Value {
+    let mut all_models = BTreeSet::new();
+    let mut all_efforts = BTreeSet::new();
+    let mut running_count = 0_usize;
+    let mut queued_count = 0_usize;
+    let mut match_count = 0_usize;
+    let mut ranked_count = 0_usize;
+    let mut suspect_count = 0_usize;
+    let mut insufficient_count = 0_usize;
+    let mut failed_count = 0_usize;
+    let mut interrupted_count = 0_usize;
+    let mut skipped_count = 0_usize;
+
+    let mut records = Vec::with_capacity(state.queue.len() + state.history.len());
+    for q in &state.queue {
+        if q.claimed {
+            running_count += 1;
+        } else {
+            queued_count += 1;
+        }
+        if !q.model.is_empty() {
+            all_models.insert(q.model.clone());
+        }
+        if !q.effort.is_empty() {
+            all_efforts.insert(q.effort.clone());
+        }
+        let fallback = live_labels.get(&q.account_id);
+        records.push(RunRecord {
+            kind: "queue",
+            run_id: q.run_id.clone(),
+            account_id: q.account_id.clone(),
+            account_email: q
+                .account_email
+                .clone()
+                .or_else(|| fallback.and_then(|m| m.email.clone())),
+            account_name: q
+                .account_name
+                .clone()
+                .or_else(|| fallback.and_then(|m| m.name.clone())),
+            model: q.model.clone(),
+            effort: q.effort.clone(),
+            scheduled: q.scheduled,
+            status: if q.claimed { "running" } else { "queued" }.into(),
+            round: Some(if q.first_round.is_some() { 2 } else { 1 }),
+            queued_at: Some(q.queued_at),
+            ended_at: None,
+            plugin_version: None,
+            first_round: q.first_round.clone(),
+            outcome: None,
+        });
+    }
+    for h in &state.history {
+        match h.outcome.verdict {
+            Verdict::Match => match_count += 1,
+            Verdict::Ranked => ranked_count += 1,
+            Verdict::Suspect => suspect_count += 1,
+            Verdict::Insufficient => insufficient_count += 1,
+            Verdict::Failed => failed_count += 1,
+            Verdict::Interrupted => interrupted_count += 1,
+            Verdict::Skipped => skipped_count += 1,
+        }
+        if !h.model.is_empty() {
+            all_models.insert(h.model.clone());
+        }
+        if !h.effort.is_empty() {
+            all_efforts.insert(h.effort.clone());
+        }
+        let fallback = live_labels.get(&h.account_id);
+        records.push(RunRecord {
+            kind: "history",
+            run_id: h.run_id.clone(),
+            account_id: h.account_id.clone(),
+            account_email: h
+                .account_email
+                .clone()
+                .or_else(|| fallback.and_then(|m| m.email.clone())),
+            account_name: h
+                .account_name
+                .clone()
+                .or_else(|| fallback.and_then(|m| m.name.clone())),
+            model: h.model.clone(),
+            effort: h.effort.clone(),
+            scheduled: h.scheduled,
+            status: h.outcome.verdict.as_str().into(),
+            round: None,
+            queued_at: None,
+            ended_at: Some(h.ended_at),
+            plugin_version: Some(h.plugin_version.clone()),
+            first_round: h.first_round.clone(),
+            outcome: Some(h.outcome.clone()),
+        });
+    }
+
+    let filtered: Vec<RunRecord> = records
+        .into_iter()
+        .filter(|record| matches_query(record, query))
+        .collect();
+    let total = filtered.len();
+    let total_pages = if total == 0 {
+        1
+    } else {
+        total.div_ceil(query.page_size)
+    };
+    let page = query.page.min(total_pages);
+    let start = (page - 1) * query.page_size;
+    let end = (start + query.page_size).min(total);
+    let items = if start < end {
+        &filtered[start..end]
+    } else {
+        &[]
+    };
+
+    json!({
+        "items": items,
+        "pagination": {
+            "page": page,
+            "pageSize": query.page_size,
+            "total": total,
+            "totalPages": total_pages,
+        },
+        "summary": {
+            "total": state.queue.len() + state.history.len(),
+            "running": running_count,
+            "queued": queued_count,
+            "historyTotal": state.history.len(),
+            "match": match_count,
+            "ranked": ranked_count,
+            "suspect": suspect_count,
+            "insufficient": insufficient_count,
+            "failed": failed_count,
+            "interrupted": interrupted_count,
+            "skipped": skipped_count,
+        },
+        "filters": {
+            "models": all_models.into_iter().collect::<Vec<_>>(),
+            "efforts": all_efforts.into_iter().collect::<Vec<_>>(),
+        },
+    })
+}
+
+fn matches_query(record: &RunRecord, query: &RunQuery) -> bool {
+    if let Some(scheduled) = query.source
+        && record.scheduled != scheduled
+    {
+        return false;
+    }
+    if let Some(verdict) = &query.verdict
+        && record.status != *verdict
+    {
+        return false;
+    }
+    if let Some(model) = &query.model
+        && record.model != *model
+    {
+        return false;
+    }
+    if let Some(effort) = &query.effort
+        && record.effort != *effort
+    {
+        return false;
+    }
+    if let Some(account_id) = &query.account_id
+        && record.account_id != *account_id
+    {
+        return false;
+    }
+    if let Some(needle) = &query.search {
+        let mut matched = record.account_id.to_ascii_lowercase().contains(needle)
+            || record.run_id.to_ascii_lowercase().contains(needle)
+            || record.model.to_ascii_lowercase().contains(needle)
+            || record.effort.to_ascii_lowercase().contains(needle)
+            || record
+                .account_email
+                .as_deref()
+                .is_some_and(|e| e.to_ascii_lowercase().contains(needle))
+            || record
+                .account_name
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().contains(needle));
+        if !matched && let Some(round) = record.outcome.as_ref().and_then(|o| o.last_round.as_ref())
+        {
+            matched = round.ranking.candidates.iter().any(|c| {
+                c.id.to_ascii_lowercase().contains(needle)
+                    || c.label.to_ascii_lowercase().contains(needle)
+            });
+        }
+        if !matched {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_query(raw: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if let (Some(key), Some(val)) = (percent_decode(k), percent_decode(v))
+            && !key.is_empty()
+        {
+            map.insert(key, val);
+        }
+    }
+    map
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = hex_val(bytes[i + 1])?;
+                let lo = hex_val(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            b'%' => return None,
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -329,7 +868,11 @@ fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Reason> {
 }
 
 fn schedule_value(state: &State) -> Value {
-    json!({"settings":state.settings,"nextDueAt":state.next_due_at,"lastSkip":state.last_schedule_skip})
+    json!({
+        "settings": state.settings,
+        "nextDueAt": state.next_due_at,
+        "lastSkip": state.last_schedule_skip,
+    })
 }
 
 fn failure(reason: Reason) -> Outcome {
@@ -360,6 +903,8 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::HistoryItem;
+
     #[test]
     fn operational_failures_and_incomplete_replies_never_create_a_suspect() {
         for reason in [
@@ -376,5 +921,80 @@ mod tests {
             failure(Reason::UnsupportedProfile).verdict,
             Verdict::Insufficient
         );
+    }
+
+    #[test]
+    fn runs_query_filters_and_paginates_queue_and_history() {
+        let mut state = State::default();
+        let labels = BTreeMap::from([(
+            "acct_1".into(),
+            AccountMeta {
+                email: Some("alice@example.com".into()),
+                name: Some("Alice".into()),
+            },
+        )]);
+        state
+            .enqueue_manual(
+                "m-run1234567".into(),
+                Target::new(
+                    "key_1".into(),
+                    "gpt-6-sol".into(),
+                    "high".into(),
+                    vec!["acct_1".into()],
+                ),
+                1000,
+                &labels,
+            )
+            .unwrap();
+        for idx in 0..25_u64 {
+            state.history.push(HistoryItem {
+                run_id: format!("m-hist{idx:04}"),
+                account_id: format!("acct_{}", idx % 3),
+                account_email: Some(if idx % 2 == 0 {
+                    "alice@example.com".into()
+                } else {
+                    "bob@example.com".into()
+                }),
+                account_name: None,
+                model: if idx % 2 == 0 {
+                    "gpt-6-sol".into()
+                } else {
+                    "gpt-6.2-sol".into()
+                },
+                effort: if idx % 3 == 0 {
+                    "high".into()
+                } else {
+                    "low".into()
+                },
+                legacy_profile_id: None,
+                scheduled: idx % 4 == 0,
+                ended_at: 2000 + idx,
+                plugin_version: "0.2.0".into(),
+                first_round: None,
+                outcome: Outcome::no_rank(
+                    if idx % 5 == 0 {
+                        Verdict::Failed
+                    } else {
+                        Verdict::Match
+                    },
+                    Reason::Timeout,
+                ),
+            });
+        }
+        let q = parse_query("page=2&pageSize=5&search=alice%40example.com&model=gpt-6-sol");
+        let params = RunQuery::from_map(&q).unwrap();
+        let res = build_runs_response(&state, &params, &BTreeMap::new());
+        assert_eq!(res["pagination"]["page"], 2);
+        assert_eq!(res["pagination"]["pageSize"], 5);
+        assert_eq!(res["pagination"]["total"], 14); // 1 queued + 13 history
+        assert_eq!(res["pagination"]["totalPages"], 3);
+        assert_eq!(res["items"].as_array().unwrap().len(), 5);
+        assert_eq!(res["summary"]["queued"], 1);
+        assert_eq!(res["summary"]["historyTotal"], 25);
+
+        let q2 = parse_query("source=scheduled&verdict=failed");
+        let params2 = RunQuery::from_map(&q2).unwrap();
+        let res2 = build_runs_response(&state, &params2, &BTreeMap::new());
+        assert_eq!(res2["pagination"]["total"], 2); // idx 0 and 20
     }
 }

@@ -212,14 +212,8 @@ jobs:
           path: .work/outcomes
       - id: verdict
         name: Choose verified reuse, rebuild, or block
-        env:
-          REQUIRE_VALIDATED: ${{ vars.CPR_ENABLE_PUBLISH == 'true' && github.ref_name == github.event.repository.default_branch && !inputs.dry_run && needs.discover.outputs.prerelease != 'true' }}
         run: |
-          options=()
-          if [ "$REQUIRE_VALIDATED" = "true" ]; then
-            options+=(--require-validated)
-          fi
-          python scripts/release_gate.py decide --plan .work/plan/plan.json --input .work/outcomes --output .work/decision.json --github-output "$GITHUB_OUTPUT" "${options[@]}"
+          python scripts/release_gate.py decide --plan .work/plan/plan.json --input .work/outcomes --output .work/decision.json --github-output "$GITHUB_OUTPUT"
           echo "decision_artifact=release-decision" >> "$GITHUB_OUTPUT"
       - if: always()
         uses: actions/upload-artifact@v6

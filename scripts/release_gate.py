@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tomllib
 
-from detector_assets import DATA, ROOT, bank_lock, file_sha, good, profile_stamp, verified_profiles
+from detector_assets import DATA, ROOT, bank_lock, file_sha, good
 from follow_host import (DIGEST, ID, LEDGER_BRANCH, PRERELEASE, SHA, STABLE, TRIPLES, UPSTREAM, api,
                          download_release_asset, engine_matches, host_source, ledger, own_releases, package_coverage,
                          package_manifest, prepare_host, read_json, ref_commit, release_asset, write_json)
@@ -27,13 +27,11 @@ def label(plan, triple, status, **data):
     return {"hostTag": plan["hostTag"], "hostCommit": plan["hostCommit"], "triple": triple, "status": status, **data}
 
 
-def smoke(plan, triple, work, package, profiles=(), baseline=None):
+def smoke(plan, triple, work, package, baseline=None):
     host = prepare_host(plan, triple, work)
     cmd = [sys.executable, str(ROOT / "scripts/smoke_host.py"), "--host-dir", str(host),
            "--host-tag", plan["hostTag"], "--host-sha", plan["hostCommit"], "--package", str(package),
            "--log", str(work / "smoke.log")]
-    for profile in profiles:
-        cmd.extend(("--required-profile", profile))
     if baseline:
         cmd.extend(("--baseline", str(baseline)))
     return subprocess.run(cmd, check=False).returncode == 0
@@ -48,7 +46,7 @@ def verify_old(plan, triple, work):
     assets = previous["assets"]
     version = previous["version"]
     report = read_json(release_asset(assets, "verification.json", work / "previous"))
-    if report["pluginVersion"] != version or not report["validatedProfiles"] or not SHA.fullmatch(report["sourceCommit"]):
+    if report["pluginVersion"] != version or not SHA.fullmatch(report["sourceCommit"]):
         return label(plan, triple, "block", reason="missing or invalid prior validation report")
     name = filename(version, triple)
     package = release_asset(assets, name, work / "previous")
@@ -60,11 +58,11 @@ def verify_old(plan, triple, work):
     problem = package_coverage(manifest, plan["contract"]["host"], plan["hostTag"])
     if problem:
         return label(plan, triple, "rebuild" if problem != "wrong plugin identity" else "block", reason=problem)
-    if not smoke(plan, triple, work, package, report["validatedProfiles"]):
+    if not smoke(plan, triple, work, package):
         changed_sdk = bool(plan["contract"]["sdkChangedFiles"]) or report.get("sdkFingerprint") != plan["contract"]["sdkFingerprint"]
         return label(plan, triple, "rebuild" if changed_sdk else "block", reason="prior-package-smoke-failed")
     return label(plan, triple, "reuse", pluginVersion=version, asset=name, sha256=digest,
-                 validatedProfiles=report["validatedProfiles"], sourceCommit=report["sourceCommit"])
+                 sourceCommit=report["sourceCommit"])
 
 
 def inspect_glibc_versions(archive):
@@ -105,8 +103,7 @@ def build(plan, triple, work, output, manifest_only=False):
     problem = package_coverage(manifest, plan["contract"]["host"], plan["hostTag"])
     if problem or manifest["package"]["protocolVersion"] != plan["contract"]["candidateProtocol"]:
         raise ValueError(f"New package does not match its host contract: {problem}")
-    profiles = verified_profiles()
-    if not smoke(plan, triple, work, package, profiles, baseline / filename("0.0.0", triple)):
+    if not smoke(plan, triple, work, package, baseline / filename("0.0.0", triple)):
         raise RuntimeError("Candidate failed install/management/state upgrade/restart smoke; release blocked")
     extra = {}
     if triple.endswith("linux-gnu"):
@@ -116,7 +113,7 @@ def build(plan, triple, work, output, manifest_only=False):
             extra["glibcVersions"] = glibc
             print(f"Linux binary glibc requirements ({triple}): max={glibc[-1]} ({', '.join(glibc)})")
     return label(plan, triple, "verified", pluginVersion=version, asset=package.name, sha256=file_sha(package),
-                 validatedProfiles=profiles, **extra)
+                 **extra)
 
 
 def rows_for(plan, files):
@@ -149,21 +146,13 @@ def reduce(args):
     else:
         rows = rows_for(plan, files)
     route = classify(plan, rows)
-    block_reason = None
-    if getattr(args, "require_validated", False) and route in {"rebuild", "manifest-only"} and not verified_profiles():
-        route = "block"
-        block_reason = "no-validated-profiles"
     payload = {"route": route, "results": rows}
-    if block_reason:
-        payload["blockReason"] = block_reason
     write_json(args.output, payload)
     print(f"Decision: {route}\n{json.dumps(rows, indent=2)}")
     if args.github_output:
         with args.github_output.open("a") as f:
             print(f"route={route}", file=f)
     if route == "block":
-        if block_reason == "no-validated-profiles":
-            raise RuntimeError("No authorized validation evidence; blocking rebuild before starting 3-platform runners")
         raise RuntimeError("Validation failed; automatic publication is blocked")
 
 
@@ -184,11 +173,8 @@ def assemble(plan, rows, route, source_commit, candidate_dir=None):
             raise ValueError("Not all rebuilt packages passed verification")
     else:
         raise ValueError("Blocked route cannot be published")
-    profiles = rows[0]["validatedProfiles"]
-    if any(row["validatedProfiles"] != profiles or row["pluginVersion"] != version for row in rows):
-        raise ValueError("Platforms disagree on plugin version or validated profiles")
-    if not prerelease and not profiles:
-        raise ValueError("Production requires the same nonempty set of authorized model profiles across platforms")
+    if any(row["pluginVersion"] != version for row in rows):
+        raise ValueError("Platforms disagree on plugin version")
     assets = {}
     packages = []
     for row in rows:
@@ -205,7 +191,7 @@ def assemble(plan, rows, route, source_commit, candidate_dir=None):
             meta["maxGlibc"] = row["maxGlibc"]
         assets[triple] = meta
     entry = {"schemaVersion": 1, "hostTag": plan["hostTag"], "hostCommit": plan["hostCommit"], "pluginId": ID,
-             "pluginVersion": version, "sourceCommit": source_commit, "platforms": assets, "validatedProfiles": profiles,
+             "pluginVersion": version, "sourceCommit": source_commit, "platforms": assets,
              "detectorRevision": bank_lock()["revision"], "sdkFingerprint": plan["contract"]["sdkFingerprint"]}
     if prerelease:
         entry["prerelease"] = True
@@ -282,12 +268,8 @@ def publish(args):
         candidates = args.input
         if candidates is None:
             raise ValueError("No candidate packages supplied: release blocked")
-        if not prerelease and not verified_profiles():
-            raise ValueError("No authorized validation evidence or candidate packages: production release blocked")
         rows = rows_for(plan, sorted(candidates.rglob("candidate.json")))
         entry, packages = assemble(plan, rows, route, args.source, candidates)
-        if not prerelease and entry["validatedProfiles"] != verified_profiles():
-            raise ValueError("Candidate did not validate this checkout's qualified profiles")
     if old is not None and (
         old["platforms"] != entry["platforms"]
         or old["pluginVersion"] != entry["pluginVersion"]
@@ -370,8 +352,7 @@ def publish(args):
                 if prerelease:
                     note = (
                         f"Development preview prerelease verified on CPR {entry['hostTag']} ({entry['hostCommit']}). "
-                        "Calibration-only until authorized healthy OAuth evidence is recorded in data/profiles.json; "
-                        "does not occupy a stable version or update cpr-compatibility. "
+                        "Does not occupy a stable version or update cpr-compatibility. "
                         "Install only after checking verification.json and checksums.txt."
                     )
                     create_flags = ["--draft", "--prerelease"]
@@ -502,15 +483,10 @@ def preflight(args):
     author = read_json(ROOT / "plugin.json")
     cargo = tomllib.loads((ROOT / "Cargo.toml").read_text())
     lock = bank_lock()
-    profiles_raw = read_json(DATA / "profiles.json")
-    validated = verified_profiles()
-    unvalidated = [p["id"] for p in profiles_raw if p["id"] not in validated]
     local_assets = {name: good(DATA / name, details) for name, details in lock["files"].items()}
     blockers = []
     if cargo["package"]["version"] != author["version"]:
         blockers.append(f"version-mismatch: plugin.json={author['version']} Cargo.toml={cargo['package']['version']}")
-    if not validated:
-        blockers.append("no-validated-profiles")
     git_info = {"available": False, "headSha": None, "dirtyFiles": []}
     if (ROOT / ".git").exists():
         head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True, capture_output=True)
@@ -530,9 +506,6 @@ def preflight(args):
         "detectorRevision": lock["revision"],
         "localAssetsReady": all(local_assets.values()),
         "localAssets": local_assets,
-        "validatedProfiles": validated,
-        "unvalidatedProfiles": unvalidated,
-        "profileStamps": {p["id"]: profile_stamp(p) for p in profiles_raw},
         "git": git_info,
         "publishReady": len(blockers) == 0,
         "blockers": blockers,
@@ -582,7 +555,6 @@ def main():
         if cmd == "decide":
             parser.add_argument("--input", type=pathlib.Path)
             parser.add_argument("--github-output", type=pathlib.Path)
-            parser.add_argument("--require-validated", action="store_true")
         if cmd == "publish":
             parser.add_argument("--input", type=pathlib.Path)
             parser.add_argument("--decision", type=pathlib.Path, required=True)
