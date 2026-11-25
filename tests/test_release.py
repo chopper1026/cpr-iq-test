@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,7 +15,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 from detector_assets import file_sha
 from follow_host import TRIPLES, discovery, engine_matches, package_coverage, read_json, write_json
 from release_gate import (WORKFLOW_PATH, assemble, classify, filename, label, preflight, publish, reduce, rows_for,
-                          verify_old, verify_remote_release, verify_resume)
+                          run_gh_retry, verify_old, verify_remote_release, verify_resume)
 
 
 def make_remote_release(tag, files, *, draft=False, prerelease=False, published_at="2026-11-25T13:00:00Z", include_digest=True):
@@ -181,9 +182,12 @@ class FollowRelease(unittest.TestCase):
                   patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true",
                                           "CPR_ENABLE_PUBLISH": "true"})):
                 publish(paths)
-                self.assertEqual(run.call_count, 2)  # draft with all assets, then promote after remote digest check
+                self.assertEqual(run.call_count, 7)  # empty draft, 5 sequential uploads, then promote after remote digest check
                 self.assertIn("create", run.call_args_list[0].args[0])
-                self.assertIn("--draft=false", run.call_args_list[1].args[0])
+                for call in run.call_args_list[1:6]:
+                    self.assertIn("upload", call.args[0])
+                    self.assertIn("--clobber", call.args[0])
+                self.assertIn("--draft=false", run.call_args_list[6].args[0])
                 self.assertIn("compatibility/v3.54.6.json", write.call_args_list[-1].args[0])
                 receipt = read_json(paths.output / "publish-receipt.json")
                 self.assertEqual(receipt["stage"], "verified")
@@ -224,7 +228,8 @@ class FollowRelease(unittest.TestCase):
                                           "CPR_ENABLE_PUBLISH": "true", "GITHUB_RUN_ID": "999"})):
                 with self.assertRaisesRegex(ValueError, "Remote asset SHA-256 mismatch"):
                     publish(paths)
-                self.assertEqual(run.call_count, 1)  # never promoted draft to public
+                self.assertEqual(run.call_count, 6)  # draft + 5 sequential uploads, never promoted draft to public
+                self.assertTrue(all("edit" not in call.args[0] for call in run.call_args_list))
                 write.assert_not_called()
                 receipt = read_json(paths.output / "publish-receipt.json")
                 self.assertEqual(receipt["stage"], "failed")
@@ -493,9 +498,12 @@ class FollowRelease(unittest.TestCase):
                   patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true"}, clear=False)):
                 os.environ.pop("CPR_ENABLE_PUBLISH", None)
                 publish(paths)
-                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_count, 7)
                 self.assertIn("--prerelease", run.call_args_list[0].args[0])
-                self.assertIn("--latest=false", run.call_args_list[1].args[0])
+                for call in run.call_args_list[1:6]:
+                    self.assertIn("upload", call.args[0])
+                    self.assertIn("--clobber", call.args[0])
+                self.assertIn("--latest=false", run.call_args_list[6].args[0])
                 write.assert_not_called()  # prerelease never mutates cpr-compatibility
                 receipt = read_json(paths.output / "publish-receipt.json")
                 self.assertTrue(receipt["prerelease"])
@@ -505,6 +513,74 @@ class FollowRelease(unittest.TestCase):
                 paths.allow_prerelease = False
                 with self.assertRaisesRegex(ValueError, "--allow-prerelease"):
                     publish(paths)
+
+    def test_publish_retries_transient_gh_5xx_and_avoids_duplicate_draft(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = pathlib.Path(scratch)
+            self.plan["prerelease"] = True
+            self.plan["previous"] = None
+            self.plan["candidateVersion"] = "0.1.0-dev.2"
+            paths, packages = self.make_publish_fixture(root)
+            paths.allow_prerelease = True
+            tag = "v0.1.0-dev.2"
+            state = {"created": False, "create_calls": 0, "uploaded": [], "upload_flaked": False,
+                     "edit_flaked": False, "promoted": False}
+
+            def fake_run(cmd, **kwargs):
+                if "create" in cmd:
+                    state["create_calls"] += 1
+                    if state["create_calls"] == 1:
+                        raise subprocess.CalledProcessError(1, cmd, stderr="HTTP 500 (https://api.github.com/repos/example/plugin/releases)")
+                    # Second attempt creates draft on server before returning 502; check_done must stop retries.
+                    state["created"] = True
+                    raise subprocess.CalledProcessError(1, cmd, stderr="HTTP 502: Bad Gateway")
+                if "upload" in cmd:
+                    asset = pathlib.Path(cmd[-2])
+                    if not state["upload_flaked"]:
+                        state["upload_flaked"] = True
+                        raise subprocess.CalledProcessError(1, cmd, stderr="HTTP 502: Error updating policy")
+                    if asset not in state["uploaded"]:
+                        state["uploaded"].append(asset)
+                    return None
+                if "edit" in cmd:
+                    if not state["edit_flaked"]:
+                        state["edit_flaked"] = True
+                        raise subprocess.CalledProcessError(1, cmd, stderr="HTTP 503: Service Unavailable")
+                    state["promoted"] = True
+                    return None
+
+            def fake_own_releases(_repo):
+                if not state["created"]:
+                    return []
+                return [make_remote_release(tag, state["uploaded"], draft=True, prerelease=True)]
+
+            def fake_api(route, missing=False):
+                if route == f"repos/example/plugin/releases/tags/{tag}" and state["promoted"]:
+                    files = (*packages, paths.output / "checksums.txt", paths.output / "verification.json")
+                    return make_remote_release(tag, files, draft=False, prerelease=True)
+                return None
+
+            with (patch("release_gate.api", side_effect=fake_api),
+                  patch("release_gate.own_releases", side_effect=fake_own_releases),
+                  patch("release_gate.ref_commit", return_value=self.sha),
+                  patch("release_gate.subprocess.run", side_effect=fake_run),
+                  patch("release_gate.time.sleep") as sleep_mock,
+                  patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true"})):
+                publish(paths)
+                self.assertEqual(state["create_calls"], 2)  # stopped via check_done without 3rd create
+                self.assertEqual(len(state["uploaded"]), 5)
+                self.assertEqual(sleep_mock.call_count, 3)  # 1 create + 1 upload + 1 edit retry
+                receipt = read_json(paths.output / "publish-receipt.json")
+                self.assertEqual(receipt["stage"], "verified")
+
+        # Non-transient 4xx fails immediately without sleeping or retrying.
+        with (patch("release_gate.subprocess.run",
+                    side_effect=subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 422: Validation Failed")) as run,
+              patch("release_gate.time.sleep") as sleep_mock):
+            with self.assertRaises(subprocess.CalledProcessError):
+                run_gh_retry(["gh", "release", "create"])
+            self.assertEqual(run.call_count, 1)
+            sleep_mock.assert_not_called()
 
 
 if __name__ == "__main__":

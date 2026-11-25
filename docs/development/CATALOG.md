@@ -27,3 +27,4 @@
 - [docs/development/changes/20261125-initial-public-source.md](changes/20261125-initial-public-source.md)
 - [docs/development/changes/20261125-tidy-onboarding.md](changes/20261125-tidy-onboarding.md)
 - [docs/development/changes/20261125-tidy-rebuild-rev6.md](changes/20261125-tidy-rebuild-rev6.md)
+- [docs/development/changes/20261126-release-upload-retry.md](changes/20261126-release-upload-retry.md)

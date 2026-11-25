@@ -25,7 +25,7 @@ Smoke 在真实宿主二进制上验证：上传、信任、启用、管理页�
    `python3 scripts/release_gate.py preflight`（追加 `--online --repository <owner>/<repo>` 可只读核对上游最新正式版、兼容表和草稿状态）。
 2. 未设置仓库变量 `CPR_ENABLE_PUBLISH=true` 时，定时触发自动跳过。维护者可手动触发 **Verify new CPR stable releases**（指定 `host_tag`，如 `v3.54.5`；可勾选 `dry_run=true` 仅演练构建与验证，或勾选 `prerelease=true` 发布 `vX.Y.Z-dev.N` 预发布预览包，不占用正式版本、不写 `cpr-compatibility`）。首次无旧包时自动跳过 `old` 三平台矩阵直接进入 `rebuild`。
 3. 脚本在重建前先校验 `plugin.json` 与 `Cargo.toml` 版本一致、锁定宿主 tag/commit 与全部宿主回调契约（含 `host.models.list`、`host.http.dispatch`、`host.model.execute_stream` 等）。契约不符立即阻断；旧包覆盖目标版本且三平台 smoke 通过则复用；仅 `engines` 超界且 SDK 未变则清单重建；SDK 变更则三平台重编与 smoke。
-4. 设置仓库变量 `CPR_ENABLE_PUBLISH=true` 后，默认分支的非 `dry_run` 运行在三平台 smoke 全部通过后执行 `publish`：先以草稿上传三个平台包、`checksums.txt` 和 `verification.json`，逐一核对远端 5 份附件的大小与 SHA-256（缺 API 摘要时下载回算）后才转为正式版并核验 tag 提交，随后写入 `cpr-compatibility` 分支 `compatibility/vX.Y.Z.json` 并留存 `publish-receipt` artifact；遇到残留草稿直接拒绝，不覆盖已发布资产。
+4. 设置仓库变量 `CPR_ENABLE_PUBLISH=true` 后，默认分支的非 `dry_run` 运行在三平台 smoke 全部通过后执行 `publish`：先创建空草稿 Release，再按顺序逐个以 `--clobber` 上传三个平台包、`checksums.txt` 和 `verification.json`（对 GitHub 瞬时 5xx/429 及上传策略错误做有界退避重试），逐一核对远端 5 份附件的大小与 SHA-256（缺 API 摘要时下载回算）后才转为正式版并核验 tag 提交，随后写入 `cpr-compatibility` 分支 `compatibility/vX.Y.Z.json` 并留存 `publish-receipt` artifact；遇到残留草稿直接拒绝，不覆盖已发布资产。
 5. 若上传、转正或写兼容表发生瞬时失败，可在同一默认分支提交手动触发工作流并填入 `resume_run_id`（预发布续跑须同时勾选 `prerelease=true`）：`resume-verify` 校验原 run 来源、分支、commit SHA 及前置成功任务并复核候选包摘要后交由 `publish` 幂等续跑。
 6. **Early warning against CPR main** 仅做合同比对、编译与测试，不发布资产；若上游宿主接口变化，优先在 `src/host.rs` 与 `src/service.rs` 适配。
 

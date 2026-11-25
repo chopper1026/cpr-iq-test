@@ -55,7 +55,7 @@ def api(path, missing=False):
     if token := os.environ.get("GH_TOKEN"):
         headers["Authorization"] = "Bearer " + token
     error = None
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=35) as response:
                 return json.load(response)
@@ -67,7 +67,8 @@ def api(path, missing=False):
             error = e
         except (OSError, ValueError, http.client.HTTPException) as e:
             error = e
-        time.sleep(1 + attempt * 2)
+        if attempt + 1 < 5:
+            time.sleep(min(1 + attempt * 2, 8))
     raise RuntimeError(f"GitHub API read failed: {path}: {error}")
 
 

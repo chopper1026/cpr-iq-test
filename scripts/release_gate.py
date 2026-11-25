@@ -9,6 +9,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import tomllib
 
 from detector_assets import DATA, ROOT, bank_lock, file_sha, good
@@ -198,11 +199,66 @@ def assemble(plan, rows, route, source_commit, candidate_dir=None):
     return entry, packages
 
 
+TRANSIENT_GH_TOKENS = (
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "http 429",
+    "server error",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "unexpected eof",
+    "unexpected end of json",
+    "connection reset",
+    "tls handshake timeout",
+    "error updating policy",
+)
+
+
+def is_transient_gh_error(text, *, allow_not_found=False):
+    lowered = (text or "").lower()
+    if any(token in lowered for token in TRANSIENT_GH_TOKENS):
+        return True
+    if allow_not_found and ("release not found" in lowered or "http 404" in lowered):
+        return True
+    return False
+
+
+def run_gh_retry(cmd, *, attempts=6, check_done=None, allow_not_found=False):
+    for attempt in range(attempts):
+        try:
+            return subprocess.run(cmd, check=True, text=True, capture_output=True)
+        except subprocess.CalledProcessError as error:
+            detail = f"{error.stderr or ''}\n{error.stdout or ''}\n{error}"
+            if check_done is not None:
+                try:
+                    if check_done():
+                        return None
+                except Exception:
+                    pass
+            if attempt + 1 >= attempts or not is_transient_gh_error(detail, allow_not_found=allow_not_found):
+                if error.stderr:
+                    sys.stderr.write(error.stderr)
+                if error.stdout:
+                    sys.stdout.write(error.stdout)
+                raise
+            time.sleep(min(2 * (attempt + 1), 10))
+
+
 def git_write(route, data):
-    result = subprocess.run(["gh", "api", "--method", "POST" if "/git/refs" in route else "PUT", route, "--input", "-"],
-                            input=json.dumps(data), text=True, capture_output=True)
-    if result.returncode:
-        raise RuntimeError(f"Could not update compatibility ledger: {result.stderr.strip()}")
+    last_err = ""
+    for attempt in range(5):
+        result = subprocess.run(["gh", "api", "--method", "POST" if "/git/refs" in route else "PUT", route, "--input", "-"],
+                                input=json.dumps(data), text=True, capture_output=True)
+        if result.returncode == 0:
+            return
+        last_err = result.stderr.strip()
+        if attempt + 1 >= 5 or not is_transient_gh_error(last_err):
+            raise RuntimeError(f"Could not update compatibility ledger: {last_err}")
+        time.sleep(min(2 * (attempt + 1), 10))
+    raise RuntimeError(f"Could not update compatibility ledger: {last_err}")
 
 
 def verify_remote_release(release, expected_files, work, expect_published, expect_prerelease=False):
@@ -361,10 +417,15 @@ def publish(args):
                     note = f"Native plugin verified on CPR {entry['hostTag']} ({entry['hostCommit']}). Install only after checking verification.json and checksums.txt. No automatic production upgrade."
                     create_flags = ["--draft"]
                     promote_flags = ["--draft=false", "--latest"]
-                subprocess.run([*command, "create", tag, *create_flags, "--target", entry["sourceCommit"], "--title", tag,
-                                "--notes", note, *map(str, (*packages, checksums, verification_file))], check=True)
+                run_gh_retry(
+                    [*command, "create", tag, *create_flags, "--target", entry["sourceCommit"], "--title", tag,
+                     "--notes", note],
+                    check_done=lambda: len([rel for rel in own_releases(repo) if rel.get("tag_name") == tag and rel.get("draft")]) == 1,
+                )
                 last_stage = "draft-created"
                 receipt["stage"] = last_stage
+                for asset_path in (*packages, checksums, verification_file):
+                    run_gh_retry([*command, "upload", tag, str(asset_path), "--clobber"], allow_not_found=True)
                 created_drafts = [rel for rel in own_releases(repo) if rel.get("tag_name") == tag and rel.get("draft")]
                 if len(created_drafts) != 1:
                     raise RuntimeError(f"Expected exactly one draft release for {tag} after upload, found {len(created_drafts)}")
@@ -376,7 +437,14 @@ def publish(args):
                 )
                 last_stage = "draft-verified"
                 receipt["stage"] = last_stage
-                subprocess.run([*command, "edit", tag, *promote_flags], check=True)
+                run_gh_retry(
+                    [*command, "edit", tag, *promote_flags],
+                    allow_not_found=True,
+                    check_done=lambda: (
+                        (rel := api(f"repos/{repo}/releases/tags/{tag}", missing=True)) is not None
+                        and not rel.get("draft")
+                    ),
+                )
                 published = api(f"repos/{repo}/releases/tags/{tag}")
                 if (
                     published.get("draft")
