@@ -17,7 +17,10 @@
     "categories": [
       {
         "title": "使用、交付与回滚",
-        "patterns": ["docs/README.md", "docs/release.md"]
+        "patterns": [
+          "docs/README.md",
+          "docs/release.md"
+        ]
       },
       {
         "title": "现行开发规范与契约",
@@ -25,7 +28,14 @@
           "docs/development/INDEX.md",
           "docs/development/COMMIT_CONVENTION.md",
           "docs/development/ARCHITECTURE.md",
+          "docs/development/PERSISTENCE.md",
           "docs/development/FEATURES.md"
+        ]
+      },
+      {
+        "title": "交接与验收快照",
+        "patterns": [
+          "docs/development/HANDOFF.md"
         ]
       }
     ]
@@ -47,25 +57,215 @@
       "docs/release.md",
       "docs/development/*.md"
     ],
-    "exclude": ["docs/development/changes/*"],
-    "json": [".tidy.json", "plugin.json", "data/detector.lock.json", "data/profiles.json"],
+    "exclude": [
+      "docs/development/changes/*"
+    ],
+    "json": [
+      ".tidy.json",
+      "plugin.json",
+      "data/detector.lock.json",
+      "data/profiles.json",
+      "tests/known_other.json"
+    ],
+    "toml": [
+      "Cargo.toml",
+      "rust-toolchain.toml"
+    ],
     "references": [
-      {"document": "README.md", "target": "scripts/detector_assets.py"},
-      {"document": "README.md", "target": "scripts/package.py"},
-      {"document": "README.md", "target": ".github/workflows/follow-host.yml"},
-      {"document": "THIRD_PARTY.md", "target": "LICENSE-lm-detector"},
-      {"document": "THIRD_PARTY.md", "target": "data/detector.lock.json"},
-      {"document": "THIRD_PARTY.md", "target": "Cargo.lock"},
-      {"document": "docs/release.md", "target": "data/profiles.json"},
-      {"document": "docs/release.md", "target": "scripts/smoke_host.py"},
-      {"document": "docs/release.md", "target": "tests/known_other.json"}
+      {
+        "document": "README.md",
+        "target": "scripts/detector_assets.py"
+      },
+      {
+        "document": "README.md",
+        "target": "scripts/package.py"
+      },
+      {
+        "document": "README.md",
+        "target": ".github/workflows/follow-host.yml"
+      },
+      {
+        "document": "README.md",
+        "target": "src/host.rs"
+      },
+      {
+        "document": "README.md",
+        "target": "src/service.rs"
+      },
+      {
+        "document": "README.md",
+        "target": "src/fingerprint.rs"
+      },
+      {
+        "document": "README.md",
+        "target": "src/domain.rs"
+      },
+      {
+        "document": "THIRD_PARTY.md",
+        "target": "Cargo.toml"
+      },
+      {
+        "document": "THIRD_PARTY.md",
+        "target": "LICENSE-lm-detector"
+      },
+      {
+        "document": "THIRD_PARTY.md",
+        "target": "data/detector.lock.json"
+      },
+      {
+        "document": "THIRD_PARTY.md",
+        "target": "Cargo.lock"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "data/profiles.json"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "scripts/detector_assets.py"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "scripts/package.py"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "scripts/smoke_host.py"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "scripts/release_gate.py"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "tests/known_other.json"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "plugin.json"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "Cargo.toml"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "src/host.rs"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "src/service.rs"
+      },
+      {
+        "document": "docs/development/PERSISTENCE.md",
+        "target": "plugin.json"
+      },
+      {
+        "document": "docs/development/PERSISTENCE.md",
+        "target": "src/host.rs"
+      },
+      {
+        "document": "docs/development/PERSISTENCE.md",
+        "target": "src/state_codec.rs"
+      },
+      {
+        "document": "docs/development/PERSISTENCE.md",
+        "target": "src/domain.rs"
+      },
+      {
+        "document": "docs/development/PERSISTENCE.md",
+        "target": "scripts/smoke_host.py"
+      },
+      {
+        "document": "docs/development/PERSISTENCE.md",
+        "target": ".gitignore"
+      },
+      {
+        "document": "docs/development/HANDOFF.md",
+        "target": "scripts/check_bound_host.sh"
+      },
+      {
+        "document": "docs/development/HANDOFF.md",
+        "target": "scripts/release_gate.py"
+      },
+      {
+        "document": "docs/development/HANDOFF.md",
+        "target": ".github/workflows/follow-host.yml"
+      },
+      {
+        "document": "docs/development/HANDOFF.md",
+        "target": "tests/test_release.py"
+      }
+    ],
+    "registries": [
+      {
+        "document": "docs/release.md",
+        "registry": "data/profiles.json",
+        "pointer": "",
+        "field": "id",
+        "names": [
+          "gpt6-sol-low"
+        ]
+      },
+      {
+        "document": "docs/development/FEATURES.md",
+        "registry": "data/profiles.json",
+        "pointer": "",
+        "field": "id",
+        "names": [
+          "gpt6-sol-low"
+        ]
+      },
+      {
+        "document": "docs/development/ARCHITECTURE.md",
+        "registry": "data/detector.lock.json",
+        "pointer": "/files",
+        "names": [
+          "unified_bank.json",
+          "shared_detector.bin"
+        ]
+      },
+      {
+        "document": "docs/development/PERSISTENCE.md",
+        "registry": "plugin.json",
+        "pointer": "/state",
+        "field": "namespace",
+        "names": [
+          "iq-test"
+        ]
+      },
+      {
+        "document": "README.md",
+        "registry": "plugin.json",
+        "pointer": "/contributes",
+        "names": [
+          "management",
+          "maintenance"
+        ]
+      },
+      {
+        "document": "THIRD_PARTY.md",
+        "registry": "Cargo.toml",
+        "pointer": "/dependencies",
+        "names": [
+          "gateway-plugin-sdk"
+        ]
+      },
+      {
+        "document": "docs/development/ARCHITECTURE.md",
+        "registry": "Cargo.toml",
+        "pointer": "/dependencies",
+        "names": [
+          "lmfpd"
+        ]
+      }
     ]
   },
   "governance": {
-    "revision": 5,
-    "fingerprint": "528e481f57f68e1d4148a75f5a3d4e94b3ec80ee522da50d3b19ac3e909cffd2",
+    "revision": 6,
+    "fingerprint": "990fce613344df0107b8ab424c267a3fb4a45976448c72bea44c889bcaf6be2e",
     "managed_hashes": {
-      "AGENTS.md": "110297d103eeb11bcce7b0862335d2133adcdb2671d60d6bf7d57e384ad1609a"
+      "AGENTS.md": "08a8d8bf9b55bae1833df1c82c7a62cddfc4e0564286ca359991b7246f27da27"
     },
     "scope": "managed-blocks-only"
   }

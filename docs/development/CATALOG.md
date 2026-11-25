@@ -14,9 +14,15 @@
 - [docs/development/COMMIT_CONVENTION.md](COMMIT_CONVENTION.md)
 - [docs/development/FEATURES.md](FEATURES.md)
 - [docs/development/INDEX.md](INDEX.md)
+- [docs/development/PERSISTENCE.md](PERSISTENCE.md)
+
+## 交接与验收快照
+
+- [docs/development/HANDOFF.md](HANDOFF.md)
 
 ## 变更与历程
 
 - [docs/development/changes/20261125-harden-release-workflow.md](changes/20261125-harden-release-workflow.md)
 - [docs/development/changes/20261125-initial-public-source.md](changes/20261125-initial-public-source.md)
 - [docs/development/changes/20261125-tidy-onboarding.md](changes/20261125-tidy-onboarding.md)
+- [docs/development/changes/20261125-tidy-rebuild-rev6.md](changes/20261125-tidy-rebuild-rev6.md)

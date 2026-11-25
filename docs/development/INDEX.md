@@ -1,9 +1,11 @@
 # 项目开发总入口
 
-- [Git 提交规范](COMMIT_CONVENTION.md)
-- [整体架构](ARCHITECTURE.md)
-- [功能全景](FEATURES.md)
-- [方案、计划、设计、图片与开发历程分类索引](CATALOG.md)
+- [Git 提交规范](COMMIT_CONVENTION.md)（提交格式、scope 登记与提交前门禁）
+- [整体架构](ARCHITECTURE.md)（系统边界、模块契约、执行流程与交付链路）
+- [持久化与备份边界](PERSISTENCE.md)（私有状态配额、备份覆盖与操作影响矩阵）
+- [功能全景](FEATURES.md)（当前实现状态与分层验证证据）
+- [阶段交接与验证快照](HANDOFF.md)（多平台构建身份、验证层级与授权边界）
+- [方案、计划、设计、图片与开发历程分类索引](CATALOG.md)（由 `tidy.py sync` 生成）
 - [插件安装、发版、回滚与许可入口](../README.md)
 
 本机资料与回执：`docs/local/tidy/INDEX.md`（sync 后生成，不入库）。
