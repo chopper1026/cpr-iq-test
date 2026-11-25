@@ -265,6 +265,9 @@ def smoke(args):
             migrated = api.call("GET", url + "/api/runs?source=scheduled&verdict=ranked")
             assert migrated["pagination"]["total"] == 1, migrated
             assert migrated["items"][0]["model"] == "gpt-6-sol" and migrated["items"][0]["effort"] == "low", migrated
+            logs = api.call("GET", url + "/api/logs?runId=m-smokemodern")
+            assert logs["recordCount"] == 1 and logs["records"][0]["runId"] == "m-smokemodern", logs
+            assert logs["detectorReady"] and isinstance(logs["runtimeLogs"], list), logs
 
         try:
             login()
@@ -274,13 +277,15 @@ def smoke(args):
             base_url = prefix_for(ext)
             assert any(page["entry"] == "web/index.html" for page in ext["pages"])
             html = api.call("GET", base_url + "/resources/web/index.html")
-            assert b"app.js" in html and b"tab-records" in html
+            assert b"app.js" in html and b"tab-records" in html and b"export-logs" in html
             assert api.call("GET", base_url + "/resources/web/app.js")
             assert api.call("GET", base_url + "/resources/web/style.css")
             catalog = api.call("GET", base_url + "/api/catalog")
             assert catalog["detectorReady"] and not catalog["accounts"] and not catalog["keys"] and catalog["models"] == [], catalog
             runs = api.call("GET", base_url + "/api/runs?page=1&pageSize=20")
             assert not runs["items"] and runs["pagination"]["total"] == 0, runs
+            empty_logs = api.call("GET", base_url + "/api/logs?scope=all")
+            assert empty_logs["recordCount"] == 0 and empty_logs["runtimeLogCount"] >= 1, empty_logs
             assert api.call("POST", base_url + "/api/runs/cancel", {}) == {"cancelled": 0}
             default = api.call("GET", base_url + "/api/schedule")["settings"]
             assert default == {"enabled": False, "hours": 24, "target": None}, default

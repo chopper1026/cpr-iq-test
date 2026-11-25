@@ -11,7 +11,7 @@
     unsupportedProfile: '宿主或上游不支持该模型或推理档位。',
     detectorUnavailable: '本地指纹参考库未就绪，未发送探针。',
     accountUnavailable: '指定账号不可用或不再是启用的 OAuth 账号。',
-    accountChanged: '采样期间账号凭据版本发生变化。',
+    accountChanged: '采样期间上游账号身份发生变化（账号被替换）。',
     accessDenied: '所选 Client Key 无法访问所选账号或该模型。',
     rateLimited: '宿主或上游触发限流。',
     timeout: '模型调用或宿主回调超时。',
@@ -22,7 +22,7 @@
     notScorable: '样本不可评分，有效数字不足或不符合语言模型分布。',
     nearby: '目标模型名次接近或头两名差距过小，无法单独判定。',
     inconsistent: '两轮独立检测结果不一致。',
-    versionChanged: '复测前模型、参考库或账号凭据版本发生变化。',
+    versionChanged: '复测前模型、参考库或上游账号身份发生变化。',
     restarted: '上次调用期间插件或宿主重启；为避免重复消耗，未自动重发。',
     scheduleChanged: '定时巡检已关闭或计划已变更。',
     staleSlot: '旧巡检周期已过期，已跳过。',
@@ -122,6 +122,9 @@
   let polling = false;
   let nonce = null;
   let searchTimer = null;
+  let logBundle = null;
+  let logTargetRunId = null;
+  const canDownloadFile = window.origin !== 'null';
 
   const queryState = {
     page: 1,
@@ -597,13 +600,36 @@
       } else if (item.kind === 'queue') {
         statusTd.append(make('div', item.round === 2 ? '第 2 轮复测中' : '第 1 轮检测', 'detail'));
       }
+      if (item.diagnostics) {
+        const d = item.diagnostics;
+        const okProbes = (d.probes || []).filter(p => p.ok).length;
+        const totalProbes = (d.probes || []).length;
+        const sec = d.durationMs != null ? `${(d.durationMs / 1000).toFixed(1)}s` : '';
+        const revNote = d.credentialRevisionBefore != null && d.credentialRevisionAfter != null && d.credentialRevisionBefore !== d.credentialRevisionAfter
+          ? ` · 凭据版本 ${d.credentialRevisionBefore}→${d.credentialRevisionAfter}`
+          : '';
+        const summaryParts = [sec, totalProbes ? `探针 ${okProbes}/${totalProbes}` : ''].filter(Boolean).join(' · ');
+        if (summaryParts || revNote) {
+          statusTd.append(make('div', `${summaryParts}${revNote}`, 'detail mono'));
+        }
+        if (d.errorDetail && code !== 'match' && code !== 'ranked') {
+          statusTd.append(make('div', d.errorDetail, 'detail mono'));
+        }
+      }
 
       const timeTd = make('td');
       timeTd.append(make('div', localDate(item.endedAt || item.queuedAt)));
       timeTd.append(make('div', item.runId, 'detail mono'));
       timeTd.title = `任务 ${item.runId}${item.pluginVersion ? ` · 插件 ${item.pluginVersion}` : ''}`;
 
-      tr.append(accountTd, modelTd, statusTd, renderRankingCell(item), timeTd);
+      const actionTd = make('td');
+      const logBtn = make('button', '日志', 'mini-btn');
+      logBtn.type = 'button';
+      logBtn.title = `查看并导出任务 ${item.runId} 的诊断日志`;
+      logBtn.addEventListener('click', () => openLogs(item.runId));
+      actionTd.append(logBtn);
+
+      tr.append(accountTd, modelTd, statusTd, renderRankingCell(item), timeTd, actionTd);
       return tr;
     });
 
@@ -826,6 +852,242 @@
     $('records-notice').textContent = '';
     fetchRuns();
   });
+
+  function formatMs(ms) {
+    if (ms == null) return '—';
+    return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s (${ms}ms)` : `${ms}ms`;
+  }
+
+  function formatLogText(bundle) {
+    const lines = [];
+    lines.push('=== cpr-iq-test 账号指纹巡检诊断日志 ===');
+    lines.push(`导出时间: ${new Date(bundle.exportedAt).toISOString()}`);
+    lines.push(`插件版本: ${bundle.pluginVersion || 'unknown'}`);
+    lines.push(`参考指纹库: ready=${bundle.detectorReady} revision=${bundle.detectorRevision || '-'}`);
+    const env = bundle.environment || {};
+    lines.push(`环境摘要: 启用账号=${env.accountCount ?? 0} 模型数=${env.modelCount ?? 0} 目录错误=${env.modelCatalogError || '无'}`);
+    lines.push(`任务记录数: ${bundle.recordCount ?? 0}  运行期事件日志数: ${bundle.runtimeLogCount ?? 0}`);
+    lines.push('');
+    for (const rec of bundle.records || []) {
+      const verdict = rec.status || rec.outcome?.verdict || '-';
+      const reason = rec.outcome?.reason || '-';
+      lines.push(`--- 任务 ${rec.runId} ---`);
+      lines.push(`账号: ${rec.accountEmail || rec.accountName || rec.accountId} (${rec.accountId})`);
+      lines.push(`目标: ${rec.model} / effort=${rec.effort} / 来源=${rec.scheduled ? '定时' : '手动'}`);
+      lines.push(`结论: ${verdict} (${verdictLabels[verdict] || verdict})  原因: ${reason}`);
+      if (rec.outcome?.lastRound?.ranking?.candidates?.length) {
+        const cands = rec.outcome.lastRound.ranking.candidates
+          .map((c, idx) => `#${idx + 1} ${c.label}${c.probabilityBps != null ? ` (${formatProb(c.probabilityBps)})` : ''}`)
+          .join(', ');
+        lines.push(`候选 Top-3: ${cands}`);
+      }
+      if (rec.diagnostics) {
+        const d = rec.diagnostics;
+        lines.push(`诊断: round=${d.round} stage=${d.stage} duration=${formatMs(d.durationMs)} plan=${d.planType || '-'} expectedLabel=${d.expectedLabel || '(未收录)'}`);
+        lines.push(`凭据版本: before=${d.credentialRevisionBefore ?? '-'} after=${d.credentialRevisionAfter ?? '-'} identityChanged=${Boolean(d.identityChanged)}`);
+        if (d.detectorDecision || d.probabilityStatus) {
+          lines.push(`评分器: decision=${d.detectorDecision || '-'} usedOutputs=${d.usedOutputs ?? '-'} probStatus=${d.probabilityStatus || '-'}`);
+        }
+        if (d.errorDetail) {
+          lines.push(`错误详情: ${d.errorDetail}`);
+        }
+        for (const p of d.probes || []) {
+          lines.push(
+            `  Probe #${p.index} (${p.challengeId}, expect=${p.expectedCount}): ok=${p.ok} duration=${formatMs(p.durationMs)} ` +
+            `batches=${p.batches} events=${p.events} parts=${p.textParts} textChars=${p.textChars} reasoningChars=${p.reasoningChars} ` +
+            `finish=${p.finishReason || '-'} wire=${p.wireTerminal || '-'}` +
+            (p.errorReason ? ` err=${p.errorReason}` : '') +
+            (p.errorDetail ? ` detail=${p.errorDetail}` : '')
+          );
+        }
+      } else {
+        lines.push('诊断: (旧版本或排队记录，无逐探针持久化明细)');
+      }
+      lines.push('');
+    }
+    if ((bundle.runtimeLogs || []).length) {
+      lines.push('=== 运行期事件日志（按时间顺序） ===');
+      for (const entry of bundle.runtimeLogs) {
+        const ts = new Date(entry.at).toISOString();
+        const scope = [entry.category, entry.runId, entry.accountId].filter(Boolean).join(' ');
+        const detail = entry.detail ? ` | ${JSON.stringify(entry.detail)}` : '';
+        lines.push(`[${ts}] [${String(entry.level || 'info').toUpperCase()}] (${scope}) ${entry.message}${detail}`);
+      }
+    }
+    return lines.join('\n');
+  }
+
+  function renderLogVisual(bundle) {
+    const container = $('log-visual');
+    const records = (bundle?.records || []).filter(r => r.diagnostics);
+    if (!records.length || (!logTargetRunId && records.length > 3)) {
+      container.hidden = true;
+      container.replaceChildren();
+      return;
+    }
+    const nodes = [];
+    for (const rec of records) {
+      const d = rec.diagnostics;
+      const kv = make('div', null, 'diag-meta');
+      const addKv = (label, val) => {
+        const box = make('div', null, 'diag-kv');
+        box.append(make('span', label), make('strong', val));
+        kv.append(box);
+      };
+      addKv('任务 / 账号', `${rec.runId} · ${resolveRecordEmail(rec)}`);
+      addKv('模型 / 档位', `${rec.model} / ${effortLabel(rec.effort)}${d.expectedLabel ? ` → ${d.expectedLabel}` : ' (仅排名)'}`);
+      addKv('结束阶段 / 耗时', `${d.stage || '—'} · ${formatMs(d.durationMs)}`);
+      addKv('凭据版本 / 身份', `${d.credentialRevisionBefore ?? '—'} → ${d.credentialRevisionAfter ?? '—'} (${d.identityChanged ? '身份变更' : '同账号身份'})`);
+      if (d.detectorDecision || d.probabilityStatus) {
+        addKv('评分器状态', `${d.detectorDecision || '—'} · 样本 ${d.usedOutputs ?? '—'}/3 · ${d.probabilityStatus || '—'}`);
+      }
+      nodes.push(kv);
+      if (d.errorDetail) {
+        nodes.push(make('div', `错误详情：${d.errorDetail}`, 'diag-err mono'));
+      }
+      if ((d.probes || []).length) {
+        const tbl = make('table', null, 'probe-table');
+        const thead = make('thead');
+        const headRow = make('tr');
+        for (const h of ['探针', '结果', '耗时', '批次 / 事件', '可见字符 / 推理字符', '结束原因 / 详情']) {
+          headRow.append(make('th', h));
+        }
+        thead.append(headRow);
+        const tbody = make('tbody');
+        for (const p of d.probes) {
+          const tr = make('tr');
+          tr.append(
+            make('td', `#${p.index} (${p.challengeId})`, 'mono'),
+            make('td', p.ok ? '成功' : (p.errorReason || '失败')),
+            make('td', formatMs(p.durationMs), 'mono'),
+            make('td', `${p.batches} / ${p.events}`, 'mono'),
+            make('td', `${p.textChars} (${p.textParts} 片) / ${p.reasoningChars}`, 'mono'),
+            make('td', [p.finishReason, p.wireTerminal, p.errorDetail].filter(Boolean).join(' · ') || '—', 'mono'),
+          );
+          tbody.append(tr);
+        }
+        tbl.append(thead, tbody);
+        nodes.push(tbl);
+      }
+    }
+    container.replaceChildren(...nodes);
+    container.hidden = false;
+  }
+
+  function renderLogOutput() {
+    if (!logBundle) return;
+    const fmt = $('log-format').value;
+    const text = fmt === 'text' ? formatLogText(logBundle) : JSON.stringify(logBundle, null, 2);
+    $('log-output').value = text;
+    renderLogVisual(logBundle);
+    const kb = (new TextEncoder().encode(text).byteLength / 1024).toFixed(1);
+    $('log-download').hidden = !canDownloadFile;
+    const sandboxHint = canDownloadFile
+      ? ''
+      : '（当前宿主沙箱禁止直接下载文件，请使用「一键复制日志」）';
+    $('log-notice').textContent = `已采集 ${logBundle.recordCount} 条任务记录与 ${logBundle.runtimeLogCount} 条运行日志（${kb} KB）${sandboxHint}`;
+  }
+
+  async function loadLogs() {
+    $('log-notice').textContent = '正在采集诊断日志…';
+    $('log-output').value = '';
+    try {
+      const params = {};
+      if (logTargetRunId) {
+        params.runId = logTargetRunId;
+      } else if ($('log-scope').value === 'all') {
+        params.scope = 'all';
+      } else {
+        params.search = queryState.search;
+        params.source = queryState.source;
+        params.verdict = queryState.verdict;
+        params.model = queryState.model;
+        params.effort = queryState.effort;
+      }
+      logBundle = await request('GET', 'logs', null, params);
+      renderLogOutput();
+    } catch (error) {
+      $('log-notice').textContent = `采集日志失败：${reasonText(error.message)}`;
+    }
+  }
+
+  function openLogs(runId = null) {
+    logTargetRunId = runId || null;
+    $('log-scope').hidden = Boolean(logTargetRunId);
+    $('log-drawer-title').textContent = logTargetRunId
+      ? `单条任务诊断日志 · ${logTargetRunId}`
+      : '诊断日志导出';
+    $('log-drawer').hidden = false;
+    $('log-drawer').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    loadLogs();
+  }
+
+  async function copyLogs() {
+    const text = $('log-output').value;
+    if (!text) return;
+    const kb = (new TextEncoder().encode(text).byteLength / 1024).toFixed(1);
+    let copied = false;
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+    if (!copied) {
+      const area = $('log-output');
+      area.focus();
+      area.select();
+      area.setSelectionRange(0, text.length);
+      try {
+        copied = document.execCommand('copy');
+      } catch {
+        copied = false;
+      }
+    }
+    $('log-notice').textContent = copied
+      ? `已复制完整诊断日志到剪贴板（${kb} KB），可直接粘贴发送排查。`
+      : '未能自动写入剪贴板，已自动全选下方文本框，请按 Ctrl+C / Cmd+C 复制。';
+  }
+
+  function downloadLogs() {
+    const text = $('log-output').value;
+    if (!text) return;
+    const isText = $('log-format').value === 'text';
+    const ext = isText ? 'txt' : 'json';
+    const stampStr = new Date().toISOString().replace(/[:.]/g, '-');
+    const name = logTargetRunId
+      ? `cpr-iq-test-log-${logTargetRunId}.${ext}`
+      : `cpr-iq-test-logs-${stampStr}.${ext}`;
+    const blob = new Blob([text], { type: isText ? 'text/plain;charset=utf-8' : 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+
+  $('export-logs').addEventListener('click', () => openLogs(null));
+  $('log-scope').addEventListener('change', () => loadLogs());
+  $('log-format').addEventListener('change', () => renderLogOutput());
+  $('log-refresh').addEventListener('click', () => loadLogs());
+  $('log-close').addEventListener('click', () => {
+    $('log-drawer').hidden = true;
+    logTargetRunId = null;
+  });
+  $('log-copy').addEventListener('click', () => copyLogs());
+  $('log-select').addEventListener('click', () => {
+    const area = $('log-output');
+    area.focus();
+    area.select();
+    area.setSelectionRange(0, area.value.length);
+    $('log-notice').textContent = '已全选日志内容，可按 Ctrl+C / Cmd+C 复制。';
+  });
+  $('log-download').addEventListener('click', () => downloadLogs());
 
   refresh(true, false);
   const timer = setInterval(() => {

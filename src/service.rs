@@ -1,7 +1,8 @@
 //! Management handlers and the single maintenance worker share the same persisted queue.
 use crate::{
     domain::{
-        self, AccountMeta, Decision, Outcome, Reason, Round, Settings, State, Target, Task, Verdict,
+        self, AccountMeta, Decision, Outcome, ProbeDiagnostic, Reason, Round, RunDiagnostic,
+        Settings, State, Target, Task, Verdict,
     },
     fingerprint::Fingerprint,
     host::{AccountChoice, DiscoveredModel, Host, safe_reason},
@@ -17,14 +18,18 @@ use gateway_plugin_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::Instant,
+};
 
 const JSON: &str = "application/json";
 const MAX_REQUEST: usize = 32 * 1024;
 const MODEL_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
+const MAX_RUNTIME_LOGS: usize = 300;
 
 type Reply = TypedReply<ManagementResponse>;
 
@@ -45,6 +50,7 @@ pub fn registration() -> ManagementRegistration {
             route("GET", "runs"),
             route("POST", "runs"),
             route("POST", "runs/cancel"),
+            route("GET", "logs"),
             route("GET", "schedule"),
             route("PUT", "schedule"),
         ],
@@ -150,6 +156,63 @@ struct CachedModels {
     error: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LogEntry {
+    seq: u64,
+    at: u64,
+    level: &'static str,
+    category: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<Value>,
+}
+
+#[derive(Default)]
+struct LogRing {
+    next_seq: u64,
+    entries: VecDeque<LogEntry>,
+}
+
+impl LogRing {
+    fn push(
+        &mut self,
+        level: &'static str,
+        category: &'static str,
+        run_id: Option<String>,
+        account_id: Option<String>,
+        message: impl Into<String>,
+        detail: Option<Value>,
+    ) {
+        self.next_seq = self.next_seq.saturating_add(1);
+        if self.entries.len() >= MAX_RUNTIME_LOGS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(LogEntry {
+            seq: self.next_seq,
+            at: now(),
+            level,
+            category,
+            run_id,
+            account_id,
+            message: message.into(),
+            detail,
+        });
+    }
+
+    fn snapshot(&self, run_id: Option<&str>) -> Vec<LogEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| run_id.is_none_or(|target| entry.run_id.as_deref() == Some(target)))
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRecord {
@@ -175,6 +238,8 @@ struct RunRecord {
     first_round: Option<Round>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<Outcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<RunDiagnostic>,
 }
 
 #[derive(Debug)]
@@ -202,16 +267,50 @@ pub struct Service {
     bank: Option<Fingerprint>,
     maintenance: Mutex<()>,
     model_cache: RwLock<Option<CachedModels>>,
+    logs: RwLock<LogRing>,
 }
 
 impl Service {
     pub fn new(version: String, bank: Option<Fingerprint>) -> Self {
+        let mut ring = LogRing::default();
+        ring.push(
+            "info",
+            "system",
+            None,
+            None,
+            "Plugin service initialized",
+            Some(json!({
+                "pluginVersion": version,
+                "detectorReady": bank.is_some(),
+                "detectorRevision": bank.as_ref().map(|b| &b.revision),
+            })),
+        );
         Self {
             version,
             bank,
             maintenance: Mutex::new(()),
             model_cache: RwLock::new(None),
+            logs: RwLock::new(ring),
         }
+    }
+
+    async fn log(
+        &self,
+        level: &'static str,
+        category: &'static str,
+        run_id: Option<&str>,
+        account_id: Option<&str>,
+        message: impl Into<String>,
+        detail: Option<Value>,
+    ) {
+        self.logs.write().await.push(
+            level,
+            category,
+            run_id.map(str::to_owned),
+            account_id.map(str::to_owned),
+            message,
+            detail,
+        );
     }
 
     pub async fn management(
@@ -265,6 +364,21 @@ impl Service {
             .await;
         let fetched_at = now();
         let views = self.annotate_models(&models);
+        self.log(
+            if error.is_some() { "warn" } else { "info" },
+            "catalog",
+            None,
+            None,
+            "Model catalog discovered",
+            Some(json!({
+                "accountCount": accounts.len(),
+                "keyCount": keys.len(),
+                "modelCount": models.len(),
+                "forceRefresh": force_refresh,
+                "error": error,
+            })),
+        )
+        .await;
         *self.model_cache.write().await = Some(CachedModels {
             fetched_at,
             key_scope,
@@ -343,6 +457,44 @@ impl Service {
                 };
                 Ok((200, build_runs_response(&state, &params, &live_labels)))
             }
+            ("GET", "logs") => {
+                let (mut state, _) = host.load().await.map_err(|e| safe_reason(&e))?;
+                state.prune(now());
+                let run_id = query
+                    .get("runId")
+                    .map(|v| v.trim().to_owned())
+                    .filter(|v| !v.is_empty());
+                if let Some(id) = &run_id
+                    && !domain::valid_id(id, 64)
+                {
+                    return Err(Reason::InvalidInput.into());
+                }
+                let scope_all = query.get("scope").is_some_and(|v| v == "all");
+                let mut params = if scope_all {
+                    RunQuery::unfiltered()
+                } else {
+                    RunQuery::from_map(&query)?
+                };
+                params.run_id = run_id.clone();
+                let accounts = host.accounts().await.unwrap_or_default();
+                let live_labels: BTreeMap<String, AccountMeta> = accounts
+                    .iter()
+                    .map(|account| (account.id.clone(), account.meta()))
+                    .collect();
+                let cached_models = self.model_cache.read().await.clone();
+                let runtime_logs = self.logs.read().await.snapshot(run_id.as_deref());
+                Ok((
+                    200,
+                    self.build_logs_response(
+                        &state,
+                        &params,
+                        &live_labels,
+                        &accounts,
+                        cached_models.as_ref(),
+                        runtime_logs,
+                    ),
+                ))
+            }
             ("GET", "schedule") => {
                 if !request.query.is_empty() {
                     return Err(Reason::InvalidInput.into());
@@ -377,6 +529,20 @@ impl Service {
                     .await
                     .map_err(|e| safe_reason(&e))?;
                 result?;
+                self.log(
+                    "info",
+                    "queue",
+                    Some(&submit.run_id),
+                    None,
+                    "Manual detection batch enqueued",
+                    Some(json!({
+                        "model": target.model,
+                        "effort": target.effort,
+                        "accountCount": count,
+                        "inReferenceBank": expected_in_bank,
+                    })),
+                )
+                .await;
                 let base = count * domain::PROBES_PER_ROUND as usize;
                 Ok((
                     202,
@@ -466,9 +632,18 @@ impl Service {
             })
             .await?;
         if let Some(task) = task {
-            let (result, refreshed_meta) = tokio::select! {
+            let (result, refreshed_meta, diagnostics) = tokio::select! {
                 biased;
-                () = call.cancellation.cancelled() => (Decision::Finish(failure(Reason::Cancelled)), None),
+                () = call.cancellation.cancelled() => (
+                    Decision::Finish(failure(Reason::Cancelled)),
+                    None,
+                    Some(RunDiagnostic {
+                        round: if task.first_round.is_some() { 2 } else { 1 },
+                        stage: "cancelled".into(),
+                        error_detail: Some("maintenance call cancelled by host".into()),
+                        ..RunDiagnostic::default()
+                    }),
+                ),
                 output = self.run_round(&host, &task) => output,
             };
             // CAS may retry this *settlement*, but never rerun a model request.
@@ -480,6 +655,7 @@ impl Service {
                     at,
                     &self.version,
                     refreshed_meta.clone(),
+                    diagnostics.clone(),
                 );
             })
             .await?;
@@ -487,10 +663,76 @@ impl Service {
         Ok(TypedReply::new(Empty {}))
     }
 
-    async fn run_round(&self, host: &Host<'_>, task: &Task) -> (Decision, Option<AccountMeta>) {
-        match self.try_round(host, task).await {
-            Ok((result, meta)) => (result, meta),
-            Err((error, meta)) => (Decision::Finish(failure(error)), meta),
+    async fn run_round(
+        &self,
+        host: &Host<'_>,
+        task: &Task,
+    ) -> (Decision, Option<AccountMeta>, Option<RunDiagnostic>) {
+        let round_num = if task.first_round.is_some() { 2 } else { 1 };
+        let started = Instant::now();
+        let mut diag = RunDiagnostic {
+            round: round_num,
+            stage: "starting".into(),
+            ..RunDiagnostic::default()
+        };
+        let result = self.try_round(host, task, &mut diag).await;
+        diag.duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        match result {
+            Ok((decision, meta)) => {
+                diag.stage = "completed".into();
+                let outcome_label = match &decision {
+                    Decision::Confirm(_) => "confirm_round2",
+                    Decision::Finish(outcome) => outcome.verdict.as_str(),
+                };
+                self.log(
+                    "info",
+                    "round",
+                    Some(&task.run_id),
+                    Some(&task.account_id),
+                    format!("Round {round_num} finished: {outcome_label}"),
+                    Some(json!({
+                        "model": task.model,
+                        "effort": task.effort,
+                        "durationMs": diag.duration_ms,
+                        "credentialRevisionBefore": diag.credential_revision_before,
+                        "credentialRevisionAfter": diag.credential_revision_after,
+                        "expectedLabel": diag.expected_label,
+                        "detectorDecision": diag.detector_decision,
+                        "usedOutputs": diag.used_outputs,
+                    })),
+                )
+                .await;
+                (decision, meta, Some(diag))
+            }
+            Err((error, meta, detail)) => {
+                if diag.error_detail.is_none() {
+                    diag.error_detail = detail;
+                }
+                self.log(
+                    "warn",
+                    "round",
+                    Some(&task.run_id),
+                    Some(&task.account_id),
+                    format!(
+                        "Round {round_num} ended with {error:?} at stage {}",
+                        diag.stage
+                    ),
+                    Some(json!({
+                        "model": task.model,
+                        "effort": task.effort,
+                        "reason": error,
+                        "stage": diag.stage,
+                        "durationMs": diag.duration_ms,
+                        "credentialRevisionBefore": diag.credential_revision_before,
+                        "credentialRevisionAfter": diag.credential_revision_after,
+                        "identityChanged": diag.identity_changed,
+                        "errorDetail": diag.error_detail,
+                        "probesExecuted": diag.probes.len(),
+                    })),
+                )
+                .await;
+                (Decision::Finish(failure(error)), meta, Some(diag))
+            }
         }
     }
 
@@ -498,60 +740,237 @@ impl Service {
         &self,
         host: &Host<'_>,
         task: &Task,
-    ) -> Result<(Decision, Option<AccountMeta>), (Reason, Option<AccountMeta>)> {
-        let bank = self
-            .bank
-            .as_ref()
-            .ok_or((Reason::DetectorUnavailable, None))?;
+        diag: &mut RunDiagnostic,
+    ) -> Result<(Decision, Option<AccountMeta>), (Reason, Option<AccountMeta>, Option<String>)>
+    {
+        diag.stage = "detector_check".into();
+        let bank = self.bank.as_ref().ok_or((
+            Reason::DetectorUnavailable,
+            None,
+            Some("reference bank not loaded".into()),
+        ))?;
+
+        diag.stage = "account_info_before".into();
         let info = host
             .account_info(&task.account_id)
             .await
-            .map_err(|e| (e, None))?;
-        let meta = Some(info.meta);
-        let stamp = bank.round_stamp(&task.model, &task.effort, info.credential_revision);
+            .map_err(|(reason, detail)| (reason, None, detail))?;
+        let meta = Some(info.meta.clone());
+        diag.credential_revision_before = Some(info.credential_revision);
+        diag.plan_type = info.meta.plan_type.clone();
+        let expected = bank.expected_label(&task.model);
+        diag.expected_label = expected.map(|(id, _)| id.to_owned());
+
+        let identity_fp = info.identity.fingerprint();
+        let stamp = bank.round_stamp(&task.model, &task.effort, &identity_fp);
         if task.first_round.as_ref().is_some_and(|r| r.stamp != stamp) {
-            return Err((Reason::VersionChanged, meta));
+            diag.stage = "round2_stamp_check".into();
+            return Err((
+                Reason::VersionChanged,
+                meta,
+                Some("round 1 stamp differs from current model/effort/reference-bank/account-identity".into()),
+            ));
         }
-        host.access(
+
+        diag.stage = "access_check".into();
+        host.access_with_detail(
             &task.client_key_id,
             std::slice::from_ref(&task.account_id),
             &task.model,
         )
         .await
-        .map_err(|e| (e, meta.clone()))?;
-        let challenges = bank.challenges().map_err(|e| (e, meta.clone()))?;
+        .map_err(|(reason, detail)| (reason, meta.clone(), detail))?;
+
+        diag.stage = "challenges".into();
+        let challenges = bank.challenges().map_err(|e| {
+            (
+                e,
+                meta.clone(),
+                Some("failed to generate lmfpd challenges".into()),
+            )
+        })?;
+
+        self.log(
+            "info",
+            "round",
+            Some(&task.run_id),
+            Some(&task.account_id),
+            format!("Starting round {}", diag.round),
+            Some(json!({
+                "email": info.meta.email,
+                "planType": info.meta.plan_type,
+                "model": task.model,
+                "effort": task.effort,
+                "credentialRevision": info.credential_revision,
+                "expectedLabel": diag.expected_label,
+            })),
+        )
+        .await;
+
         let mut outputs = Vec::with_capacity(domain::PROBES_PER_ROUND as usize);
-        for c in challenges {
-            let text = host
-                .sample(
+        for (idx, c) in challenges.into_iter().enumerate() {
+            let probe_index = (idx + 1) as u8;
+            diag.stage = format!("probe_{probe_index}");
+            let (sample_result, trace) = host
+                .sample_with_trace(
                     &task.client_key_id,
                     &task.account_id,
                     &task.model,
                     &task.effort,
                     &c.prompt,
                 )
-                .await
-                .map_err(|e| (e, meta.clone()))?;
-            outputs.push(lmfpd::Output {
-                text,
+                .await;
+            let ok = sample_result.is_ok();
+            let err_reason = sample_result.as_ref().err().copied();
+            let probe_diag = ProbeDiagnostic {
+                index: probe_index,
+                challenge_id: c.id.clone(),
                 expected_count: c.expected_count,
-            });
+                duration_ms: trace.duration_ms,
+                ok,
+                batches: trace.batches,
+                events: trace.events,
+                text_parts: trace.text_parts,
+                text_chars: trace.text_chars,
+                reasoning_chars: trace.reasoning_chars,
+                finish_reason: trace.finish_reason.clone(),
+                wire_terminal: trace.wire_terminal.clone(),
+                error_reason: err_reason,
+                error_detail: trace.error_detail.clone(),
+            };
+            self.log(
+                if ok { "info" } else { "warn" },
+                "probe",
+                Some(&task.run_id),
+                Some(&task.account_id),
+                format!(
+                    "Probe #{probe_index}/{} {} in {}ms",
+                    domain::PROBES_PER_ROUND,
+                    if ok { "succeeded" } else { "failed" },
+                    trace.duration_ms
+                ),
+                Some(json!({
+                    "challengeId": c.id,
+                    "expectedCount": c.expected_count,
+                    "batches": trace.batches,
+                    "events": trace.events,
+                    "textParts": trace.text_parts,
+                    "textChars": trace.text_chars,
+                    "reasoningChars": trace.reasoning_chars,
+                    "finishReason": trace.finish_reason,
+                    "wireTerminal": trace.wire_terminal,
+                    "errorReason": err_reason,
+                    "errorDetail": trace.error_detail,
+                })),
+            )
+            .await;
+            diag.probes.push(probe_diag);
+            match sample_result {
+                Ok(text) => outputs.push(lmfpd::Output {
+                    text,
+                    expected_count: c.expected_count,
+                }),
+                Err(reason) => {
+                    return Err((reason, meta.clone(), trace.error_detail));
+                }
+            }
         }
+
+        diag.stage = "account_info_after".into();
         let after = host
             .account_info(&task.account_id)
             .await
-            .map_err(|e| (e, meta.clone()))?;
-        if after.credential_revision != info.credential_revision {
-            return Err((Reason::AccountChanged, Some(after.meta)));
+            .map_err(|(reason, detail)| (reason, meta.clone(), detail))?;
+        diag.credential_revision_after = Some(after.credential_revision);
+        if after.identity != info.identity {
+            diag.stage = "identity_check".into();
+            diag.identity_changed = true;
+            return Err((
+                Reason::AccountChanged,
+                Some(after.meta),
+                Some(format!(
+                    "upstream account identity changed during round (credential_revision {} -> {})",
+                    info.credential_revision, after.credential_revision
+                )),
+            ));
         }
-        let round = bank
-            .rank(&outputs, stamp)
-            .map_err(|e| (e, Some(after.meta.clone())))?;
-        let expected = bank.expected_label(&task.model).map(|(id, _)| id);
+        if after.credential_revision != info.credential_revision {
+            self.log(
+                "info",
+                "round",
+                Some(&task.run_id),
+                Some(&task.account_id),
+                format!(
+                    "Account credential_revision updated {} -> {} during round with unchanged upstream identity; continuing",
+                    info.credential_revision, after.credential_revision
+                ),
+                None,
+            )
+            .await;
+        }
+
+        diag.stage = "scoring".into();
+        let (rank_result, score_trace) = bank.rank_with_trace(&outputs, stamp);
+        diag.detector_decision = score_trace.decision;
+        diag.used_outputs = score_trace.used_outputs;
+        diag.probability_status = score_trace.probability_status;
+        let round = match rank_result {
+            Ok(round) => round,
+            Err(reason) => {
+                return Err((reason, Some(after.meta), score_trace.detail));
+            }
+        };
         Ok((
-            domain::decide(expected, task.first_round.as_ref(), round),
+            domain::decide(expected.map(|(id, _)| id), task.first_round.as_ref(), round),
             Some(after.meta),
         ))
+    }
+
+    fn build_logs_response(
+        &self,
+        state: &State,
+        query: &RunQuery,
+        live_labels: &BTreeMap<String, AccountMeta>,
+        accounts: &[AccountChoice],
+        cached_models: Option<&CachedModels>,
+        runtime_logs: Vec<LogEntry>,
+    ) -> Value {
+        let (records, summary, _) = collect_run_records(state, live_labels);
+        let matched: Vec<RunRecord> = records
+            .into_iter()
+            .filter(|record| matches_query(record, query))
+            .collect();
+        let account_snapshot: Vec<Value> = accounts
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "email": a.email,
+                    "name": a.name,
+                    "planType": a.plan_type,
+                    "credentialRevision": a.credential_revision,
+                })
+            })
+            .collect();
+        json!({
+            "exportedAt": now(),
+            "pluginVersion": self.version,
+            "detectorReady": self.bank.is_some(),
+            "detectorRevision": self.bank.as_ref().map(|b| &b.revision),
+            "environment": {
+                "accountCount": accounts.len(),
+                "accounts": account_snapshot,
+                "modelCount": cached_models.map(|c| c.models.len()).unwrap_or(0),
+                "modelCatalogAt": cached_models.map(|c| c.fetched_at),
+                "modelCatalogError": cached_models.and_then(|c| c.error.as_deref()),
+            },
+            "schedule": schedule_value(state),
+            "summary": summary,
+            "recordCount": matched.len(),
+            "records": matched,
+            "runtimeLogCount": runtime_logs.len(),
+            "runtimeLogs": runtime_logs,
+        })
     }
 }
 
@@ -576,9 +995,24 @@ struct RunQuery {
     model: Option<String>,
     effort: Option<String>,
     account_id: Option<String>,
+    run_id: Option<String>,
 }
 
 impl RunQuery {
+    fn unfiltered() -> Self {
+        Self {
+            page: 1,
+            page_size: 20,
+            search: None,
+            source: None,
+            verdict: None,
+            model: None,
+            effort: None,
+            account_id: None,
+            run_id: None,
+        }
+    }
+
     fn from_map(map: &BTreeMap<String, String>) -> Result<Self, Reason> {
         let page = match map.get("page").filter(|s| !s.is_empty()) {
             Some(raw) => raw.parse::<usize>().map_err(|_| Reason::InvalidInput)?,
@@ -611,15 +1045,15 @@ impl RunQuery {
             model: clean("model"),
             effort: clean("effort"),
             account_id: clean("accountId"),
+            run_id: clean("runId"),
         })
     }
 }
 
-fn build_runs_response(
+fn collect_run_records(
     state: &State,
-    query: &RunQuery,
     live_labels: &BTreeMap<String, AccountMeta>,
-) -> Value {
+) -> (Vec<RunRecord>, Value, Value) {
     let mut all_models = BTreeSet::new();
     let mut all_efforts = BTreeSet::new();
     let mut running_count = 0_usize;
@@ -668,6 +1102,7 @@ fn build_runs_response(
             plugin_version: None,
             first_round: q.first_round.clone(),
             outcome: None,
+            diagnostics: None,
         });
     }
     for h in &state.history {
@@ -709,9 +1144,35 @@ fn build_runs_response(
             plugin_version: Some(h.plugin_version.clone()),
             first_round: h.first_round.clone(),
             outcome: Some(h.outcome.clone()),
+            diagnostics: h.diagnostics.clone(),
         });
     }
+    let summary = json!({
+        "total": state.queue.len() + state.history.len(),
+        "running": running_count,
+        "queued": queued_count,
+        "historyTotal": state.history.len(),
+        "match": match_count,
+        "ranked": ranked_count,
+        "suspect": suspect_count,
+        "insufficient": insufficient_count,
+        "failed": failed_count,
+        "interrupted": interrupted_count,
+        "skipped": skipped_count,
+    });
+    let filters = json!({
+        "models": all_models.into_iter().collect::<Vec<_>>(),
+        "efforts": all_efforts.into_iter().collect::<Vec<_>>(),
+    });
+    (records, summary, filters)
+}
 
+fn build_runs_response(
+    state: &State,
+    query: &RunQuery,
+    live_labels: &BTreeMap<String, AccountMeta>,
+) -> Value {
+    let (records, summary, filters) = collect_run_records(state, live_labels);
     let filtered: Vec<RunRecord> = records
         .into_iter()
         .filter(|record| matches_query(record, query))
@@ -739,27 +1200,17 @@ fn build_runs_response(
             "total": total,
             "totalPages": total_pages,
         },
-        "summary": {
-            "total": state.queue.len() + state.history.len(),
-            "running": running_count,
-            "queued": queued_count,
-            "historyTotal": state.history.len(),
-            "match": match_count,
-            "ranked": ranked_count,
-            "suspect": suspect_count,
-            "insufficient": insufficient_count,
-            "failed": failed_count,
-            "interrupted": interrupted_count,
-            "skipped": skipped_count,
-        },
-        "filters": {
-            "models": all_models.into_iter().collect::<Vec<_>>(),
-            "efforts": all_efforts.into_iter().collect::<Vec<_>>(),
-        },
+        "summary": summary,
+        "filters": filters,
     })
 }
 
 fn matches_query(record: &RunRecord, query: &RunQuery) -> bool {
+    if let Some(run_id) = &query.run_id
+        && record.run_id != *run_id
+    {
+        return false;
+    }
     if let Some(scheduled) = query.source
         && record.scheduled != scheduled
     {
@@ -931,6 +1382,7 @@ mod tests {
             AccountMeta {
                 email: Some("alice@example.com".into()),
                 name: Some("Alice".into()),
+                plan_type: Some("pro".into()),
             },
         )]);
         state
@@ -979,6 +1431,12 @@ mod tests {
                     },
                     Reason::Timeout,
                 ),
+                diagnostics: Some(RunDiagnostic {
+                    round: 1,
+                    stage: "completed".into(),
+                    duration_ms: 1200 + idx,
+                    ..RunDiagnostic::default()
+                }),
             });
         }
         let q = parse_query("page=2&pageSize=5&search=alice%40example.com&model=gpt-6-sol");
@@ -996,5 +1454,39 @@ mod tests {
         let params2 = RunQuery::from_map(&q2).unwrap();
         let res2 = build_runs_response(&state, &params2, &BTreeMap::new());
         assert_eq!(res2["pagination"]["total"], 2); // idx 0 and 20
+
+        let svc = Service::new("0.1.0-dev.3".into(), None);
+        let mut ring = LogRing::default();
+        ring.push(
+            "info",
+            "round",
+            Some("m-hist0000".into()),
+            Some("acct_0".into()),
+            "ok",
+            None,
+        );
+        ring.push(
+            "warn",
+            "probe",
+            Some("m-hist0001".into()),
+            Some("acct_1".into()),
+            "err",
+            None,
+        );
+        let mut q3 = RunQuery::unfiltered();
+        q3.run_id = Some("m-hist0000".into());
+        let bundle = svc.build_logs_response(
+            &state,
+            &q3,
+            &BTreeMap::new(),
+            &[],
+            None,
+            ring.snapshot(Some("m-hist0000")),
+        );
+        assert_eq!(bundle["recordCount"], 1);
+        assert_eq!(bundle["records"][0]["runId"], "m-hist0000");
+        assert_eq!(bundle["records"][0]["diagnostics"]["stage"], "completed");
+        assert_eq!(bundle["runtimeLogCount"], 1);
+        assert_eq!(bundle["runtimeLogs"][0]["runId"], "m-hist0000");
     }
 }

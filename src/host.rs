@@ -46,6 +46,51 @@ fn truncate(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+pub fn sanitize_detail(value: &str, max_chars: usize) -> String {
+    let mut compact = String::with_capacity(value.len().min(max_chars));
+    let mut prev_space = false;
+    for ch in value.chars() {
+        let ch = if ch.is_control() || ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        };
+        if ch == ' ' {
+            if !prev_space && !compact.is_empty() {
+                compact.push(' ');
+            }
+            prev_space = true;
+        } else {
+            compact.push(ch);
+            prev_space = false;
+        }
+    }
+    let lowered = compact.to_ascii_lowercase();
+    for secret_marker in ["bearer ", "cookie:", "set-cookie:", "sk-"] {
+        if let Some(pos) = lowered.find(secret_marker) {
+            compact.truncate(pos);
+            compact.push_str("[redacted]");
+            break;
+        }
+    }
+    truncate(compact.trim(), max_chars)
+}
+
+pub fn fault_detail(error: &PluginFault) -> String {
+    let kind = error
+        .details
+        .as_ref()
+        .and_then(|d| d.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let status = error
+        .http_status
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-".into());
+    let msg = sanitize_detail(&error.message, 140);
+    format!("code={:?} http={status} kind={kind} msg={msg}", error.code)
+}
+
 pub fn safe_reason(error: &PluginFault) -> Reason {
     match (error.code, error.http_status) {
         (ErrorCode::Cancelled, _) => Reason::Cancelled,
@@ -143,6 +188,7 @@ pub struct AccountChoice {
     pub email: Option<String>,
     pub name: String,
     pub plan_type: Option<String>,
+    pub credential_revision: u64,
     pub display: String,
 }
 
@@ -173,6 +219,7 @@ impl AccountChoice {
             email,
             name,
             plan_type,
+            credential_revision: account.credential_revision,
             display,
         }
     }
@@ -182,6 +229,56 @@ impl AccountChoice {
         AccountMeta {
             email: self.email.clone(),
             name,
+            plan_type: self.plan_type.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountIdentity {
+    pub provider_id: String,
+    pub authentication_kind: String,
+    pub upstream_user_id: Option<String>,
+    pub upstream_account_id: Option<String>,
+    pub email: Option<String>,
+}
+
+impl AccountIdentity {
+    fn from_runtime(account: &AuthRuntimeAccount) -> Self {
+        let clean = |opt: &Option<String>, max: usize| {
+            opt.as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| truncate(v, max))
+        };
+        Self {
+            provider_id: account.provider_id.clone(),
+            authentication_kind: account.authentication_kind.clone(),
+            upstream_user_id: clean(&account.upstream_user_id, 160),
+            upstream_account_id: clean(&account.upstream_account_id, 160),
+            email: clean(&account.email, 160).map(|e| e.to_ascii_lowercase()),
+        }
+    }
+
+    /// Stable upstream identity used across probes and confirmation rounds.
+    /// Cookie captures (`Set-Cookie`) and OAuth access-token refreshes increment
+    /// `credential_revision` in CPR without changing the upstream account identity.
+    pub fn fingerprint(&self) -> String {
+        if self.upstream_user_id.is_some() || self.upstream_account_id.is_some() {
+            format!(
+                "{}|{}|u:{}|a:{}",
+                self.provider_id,
+                self.authentication_kind,
+                self.upstream_user_id.as_deref().unwrap_or(""),
+                self.upstream_account_id.as_deref().unwrap_or(""),
+            )
+        } else if let Some(email) = self.email.as_deref() {
+            format!(
+                "{}|{}|e:{email}",
+                self.provider_id, self.authentication_kind
+            )
+        } else {
+            format!("{}|{}|local", self.provider_id, self.authentication_kind)
         }
     }
 }
@@ -189,7 +286,21 @@ impl AccountChoice {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountRuntimeInfo {
     pub credential_revision: u64,
+    pub identity: AccountIdentity,
     pub meta: AccountMeta,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SampleTrace {
+    pub duration_ms: u64,
+    pub batches: u32,
+    pub events: u32,
+    pub text_parts: u16,
+    pub text_chars: usize,
+    pub reasoning_chars: usize,
+    pub finish_reason: Option<String>,
+    pub wire_terminal: Option<String>,
+    pub error_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -413,11 +524,25 @@ impl Host<'_> {
             .collect())
     }
 
-    pub async fn account_info(&self, id: &str) -> Result<AccountRuntimeInfo, Reason> {
+    pub async fn account_info(
+        &self,
+        id: &str,
+    ) -> Result<AccountRuntimeInfo, (Reason, Option<String>)> {
         account_info(self.0, id).await
     }
 
     pub async fn access(&self, key: &str, ids: &[String], model: &str) -> Result<(), Reason> {
+        self.access_with_detail(key, ids, model)
+            .await
+            .map_err(|(reason, _)| reason)
+    }
+
+    pub async fn access_with_detail(
+        &self,
+        key: &str,
+        ids: &[String],
+        model: &str,
+    ) -> Result<(), (Reason, Option<String>)> {
         let access = self
             .0
             .check_access(AccessQuery {
@@ -426,7 +551,7 @@ impl Host<'_> {
                 upstream_model: Some(model.into()),
             })
             .await
-            .map_err(|e| safe_reason(&e))?;
+            .map_err(|e| (safe_reason(&e), Some(fault_detail(&e))))?;
         if access.client_key_id != key
             || !ids.iter().all(|id| {
                 access
@@ -435,20 +560,23 @@ impl Host<'_> {
                     .any(|a| a.account_id == *id && a.allowed)
             })
         {
-            return Err(Reason::AccessDenied);
+            return Err((
+                Reason::AccessDenied,
+                Some("host.data.access.check denied target key/account/model".into()),
+            ));
         }
         Ok(())
     }
 
-    pub async fn sample(
+    pub async fn sample_with_trace(
         &self,
         key: &str,
         account: &str,
         model: &str,
         effort: &str,
         prompt: &str,
-    ) -> Result<String, Reason> {
-        execute(self.0, key, account, model, effort, prompt).await
+    ) -> (Result<String, Reason>, SampleTrace) {
+        execute_with_trace(self.0, key, account, model, effort, prompt).await
     }
 
     pub async fn load(&self) -> Result<(State, Option<u64>), PluginFault> {
@@ -707,7 +835,10 @@ fn eligible(account: &AuthRuntimeAccount) -> bool {
     account.provider_id == PROVIDER && account.authentication_kind == "oauth" && account.enabled
 }
 
-async fn account_info(rpc: &impl Rpc, id: &str) -> Result<AccountRuntimeInfo, Reason> {
+async fn account_info(
+    rpc: &impl Rpc,
+    id: &str,
+) -> Result<AccountRuntimeInfo, (Reason, Option<String>)> {
     let account: AuthRuntimeAccount = payload(
         rpc,
         wire::AUTH_GET_RUNTIME,
@@ -716,27 +847,40 @@ async fn account_info(rpc: &impl Rpc, id: &str) -> Result<AccountRuntimeInfo, Re
         },
     )
     .await
-    .map_err(|e| safe_reason(&e))?;
+    .map_err(|e| (safe_reason(&e), Some(fault_detail(&e))))?;
     if account.account_id != id || !eligible(&account) {
-        return Err(Reason::AccountUnavailable);
+        return Err((
+            Reason::AccountUnavailable,
+            Some(format!(
+                "account ineligible: enabled={} provider={} auth_kind={} state={}",
+                account.enabled,
+                account.provider_id,
+                account.authentication_kind,
+                account.credential_state
+            )),
+        ));
     }
+    let identity = AccountIdentity::from_runtime(&account);
     let choice = AccountChoice::from_runtime(account.clone());
     Ok(AccountRuntimeInfo {
         credential_revision: account.credential_revision,
+        identity,
         meta: choice.meta(),
     })
 }
 
 /// The only model submission site. Both the provider and the required account are always present.
-async fn execute(
+async fn execute_with_trace(
     rpc: &impl Rpc,
     key: &str,
     account: &str,
     model: &str,
     effort: &str,
     prompt: &str,
-) -> Result<String, Reason> {
-    let params = serde_json::to_value(ModelExecuteRequest {
+) -> (Result<String, Reason>, SampleTrace) {
+    let mut trace = SampleTrace::default();
+    let submit_at = tokio::time::Instant::now();
+    let params = match serde_json::to_value(ModelExecuteRequest {
         client_key_id: Some(key.into()),
         model: model.into(),
         protocol: PROVIDER.into(),
@@ -744,8 +888,13 @@ async fn execute(
         provider: Some(PROVIDER.into()),
         account_id: Some(account.into()),
         previous_response_id: None,
-    })
-    .map_err(|_| Reason::HostFailure)?;
+    }) {
+        Ok(params) => params,
+        Err(_) => {
+            trace.error_detail = Some("failed to serialize ModelExecuteRequest".into());
+            return (Err(Reason::HostFailure), trace);
+        }
+    };
     let mut request_body = json!({
         "model": model,
         "input": [{"role": "user", "content": prompt}],
@@ -755,23 +904,62 @@ async fn execute(
     if !effort.is_empty() && effort != DEFAULT_EFFORT {
         request_body["reasoning"] = json!({"effort": effort});
     }
-    let body = serde_json::to_vec(&request_body).map_err(|_| Reason::HostFailure)?;
-    let submit_at = tokio::time::Instant::now();
+    let body = match serde_json::to_vec(&request_body) {
+        Ok(body) => body,
+        Err(_) => {
+            trace.error_detail = Some("failed to serialize request body".into());
+            return (Err(Reason::HostFailure), trace);
+        }
+    };
     let deadline = submit_at + MODEL_TIMEOUT;
     let reply =
-        tokio::time::timeout_at(deadline, rpc.send(wire::MODEL_EXECUTE_STREAM, params, body))
+        match tokio::time::timeout_at(deadline, rpc.send(wire::MODEL_EXECUTE_STREAM, params, body))
             .await
-            .map_err(|_| Reason::Timeout)?
-            .map_err(|e| safe_reason(&e))?;
-    let handle: ModelStreamResult =
-        serde_json::from_value(reply.result).map_err(|_| Reason::HostFailure)?;
+        {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => {
+                trace.duration_ms = elapsed_ms(submit_at);
+                trace.error_detail = Some(format!("execute_stream {}", fault_detail(&error)));
+                return (Err(safe_reason(&error)), trace);
+            }
+            Err(_) => {
+                trace.duration_ms = elapsed_ms(submit_at);
+                trace.error_detail = Some(format!(
+                    "execute_stream timed out after {}ms",
+                    trace.duration_ms
+                ));
+                return (Err(Reason::Timeout), trace);
+            }
+        };
+    let handle: ModelStreamResult = match serde_json::from_value(reply.result) {
+        Ok(handle) => handle,
+        Err(_) => {
+            trace.duration_ms = elapsed_ms(submit_at);
+            trace.error_detail = Some("invalid ModelStreamResult payload from host".into());
+            return (Err(Reason::HostFailure), trace);
+        }
+    };
     let result = if reply.payload.is_empty() {
-        tokio::time::timeout_at(deadline, read_stream(rpc, &handle.stream))
-            .await
-            .unwrap_or(Err(Reason::Timeout))
+        match tokio::time::timeout_at(deadline, read_stream(rpc, &handle.stream, &mut trace)).await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                trace.error_detail = Some(format!(
+                    "stream read timed out after {}ms (batches={} events={} text_chars={} reasoning_chars={})",
+                    elapsed_ms(submit_at),
+                    trace.batches,
+                    trace.events,
+                    trace.text_chars,
+                    trace.reasoning_chars
+                ));
+                Err(Reason::Timeout)
+            }
+        }
     } else {
+        trace.error_detail = Some("unexpected binary payload on ModelStreamResult".into());
         Err(Reason::HostFailure)
     };
+    trace.duration_ms = elapsed_ms(submit_at);
     if result.is_err() {
         let params = json!({"stream":handle.stream});
         // On parent cancellation, the host also tears down every child stream it owns.
@@ -781,34 +969,92 @@ async fn execute(
         )
         .await;
     }
-    result
+    (result, trace)
 }
 
-async fn read_stream(rpc: &impl Rpc, stream: &str) -> Result<String, Reason> {
+fn elapsed_ms(start: tokio::time::Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+async fn execute(
+    rpc: &impl Rpc,
+    key: &str,
+    account: &str,
+    model: &str,
+    effort: &str,
+    prompt: &str,
+) -> Result<String, Reason> {
+    execute_with_trace(rpc, key, account, model, effort, prompt)
+        .await
+        .0
+}
+
+async fn read_stream(
+    rpc: &impl Rpc,
+    stream: &str,
+    trace: &mut SampleTrace,
+) -> Result<String, Reason> {
     let mut text = VisibleText::default();
     let params = json!({"stream":stream,"maximum_bytes":1048576});
     for _ in 0..READ_BATCHES {
-        let reply = rpc
+        let reply = match rpc
             .send(wire::MODEL_STREAM_READ, params.clone(), vec![])
             .await
-            .map_err(|e| safe_reason(&e))?;
-        let read: ModelStreamReadResult =
-            serde_json::from_value(reply.result).map_err(|_| Reason::Incomplete)?;
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                text.snapshot_into(trace);
+                trace.error_detail = Some(format!("stream_read {}", fault_detail(&error)));
+                return Err(safe_reason(&error));
+            }
+        };
+        trace.batches = trace.batches.saturating_add(1);
+        let read: ModelStreamReadResult = match serde_json::from_value(reply.result) {
+            Ok(read) => read,
+            Err(_) => {
+                text.snapshot_into(trace);
+                trace.error_detail = Some("invalid ModelStreamReadResult metadata".into());
+                return Err(Reason::Incomplete);
+            }
+        };
         if read.events != 0 || !reply.payload.is_empty() {
-            let batch = ModelEventBatch::decode(&reply.payload).map_err(|_| Reason::Incomplete)?;
+            let batch = match ModelEventBatch::decode(&reply.payload) {
+                Ok(batch) => batch,
+                Err(_) => {
+                    text.snapshot_into(trace);
+                    trace.error_detail = Some("failed to decode ModelEventBatch".into());
+                    return Err(Reason::Incomplete);
+                }
+            };
             if batch.events.len() != read.events as usize {
+                text.snapshot_into(trace);
+                trace.error_detail = Some(format!(
+                    "event batch length mismatch: decoded={} declared={}",
+                    batch.events.len(),
+                    read.events
+                ));
                 return Err(Reason::Incomplete);
             }
             for event in batch.events {
-                text.push(event)?;
+                trace.events = trace.events.saturating_add(1);
+                if let Err(reason) = text.push(event, trace) {
+                    text.snapshot_into(trace);
+                    return Err(reason);
+                }
             }
         } else if !read.end {
+            text.snapshot_into(trace);
+            trace.error_detail = Some("empty stream batch received before end=true".into());
             return Err(Reason::Incomplete);
         }
         if read.end {
-            return text.finish();
+            text.snapshot_into(trace);
+            return text.finish(trace);
         }
     }
+    text.snapshot_into(trace);
+    trace.error_detail = Some(format!("exceeded max READ_BATCHES={READ_BATCHES}"));
     Err(Reason::Incomplete)
 }
 
@@ -816,12 +1062,24 @@ async fn read_stream(rpc: &impl Rpc, stream: &str) -> Result<String, Reason> {
 struct VisibleText {
     parts: BTreeMap<u32, String>,
     bytes: usize,
+    reasoning_chars: usize,
     completed: bool,
+    finish_reason: Option<String>,
 }
 
 impl VisibleText {
-    fn push(&mut self, event: ExecutionEvent) -> Result<(), Reason> {
+    fn snapshot_into(&self, trace: &mut SampleTrace) {
+        trace.text_parts = self.parts.len().min(u16::MAX as usize) as u16;
+        trace.text_chars = self.parts.values().map(|s| s.chars().count()).sum();
+        trace.reasoning_chars = self.reasoning_chars;
+        if self.finish_reason.is_some() {
+            trace.finish_reason = self.finish_reason.clone();
+        }
+    }
+
+    fn push(&mut self, event: ExecutionEvent, trace: &mut SampleTrace) -> Result<(), Reason> {
         if event.host.is_some_and(|host| host.middleware_transformed) {
+            trace.error_detail = Some("host flagged middleware_transformed=true".into());
             return Err(Reason::Transformed);
         }
         // Native terminal errors may be delivered on the stream, rather than in its RPC status.
@@ -844,6 +1102,25 @@ impl VisibleText {
                                 v.pointer("/response/error/code").or_else(|| v.get("code"))
                             })
                             .and_then(Value::as_str);
+                        let message = data
+                            .as_ref()
+                            .and_then(|v| {
+                                v.pointer("/response/error/message")
+                                    .or_else(|| v.get("message"))
+                            })
+                            .and_then(Value::as_str);
+                        trace.wire_terminal = Some(match code {
+                            Some(code) => format!("{kind}:{code}"),
+                            None => kind.to_owned(),
+                        });
+                        trace.error_detail = Some(sanitize_detail(
+                            &format!(
+                                "wire {kind} code={} msg={}",
+                                code.unwrap_or("-"),
+                                message.unwrap_or("-")
+                            ),
+                            200,
+                        ));
                         return Err(match code {
                             Some("rate_limit_exceeded" | "rate_limited" | "insufficient_quota") => {
                                 Reason::RateLimited
@@ -853,6 +1130,18 @@ impl VisibleText {
                         });
                     }
                     "response.incomplete" | "response.refusal.delta" | "response.refusal.done" => {
+                        let incomplete_reason = data
+                            .as_ref()
+                            .and_then(|v| v.pointer("/response/incomplete_details/reason"))
+                            .and_then(Value::as_str);
+                        trace.wire_terminal = Some(match incomplete_reason {
+                            Some(reason) => format!("{kind}:{reason}"),
+                            None => kind.to_owned(),
+                        });
+                        trace.error_detail = Some(format!(
+                            "wire terminal {kind} detail={}",
+                            incomplete_reason.unwrap_or("-")
+                        ));
                         return Err(Reason::Incomplete);
                     }
                     _ => {}
@@ -861,6 +1150,10 @@ impl VisibleText {
         }
         for fact in event.facts {
             match fact {
+                CanonicalEvent::ReasoningDelta { text, .. } => {
+                    self.reasoning_chars =
+                        self.reasoning_chars.saturating_add(text.chars().count());
+                }
                 // CPR encodes Responses content_index as `output_index * 1024 + part_index`,
                 // so a message following a reasoning item starts at index 1024. Bound distinct
                 // parts count rather than the raw index value.
@@ -870,6 +1163,8 @@ impl VisibleText {
                 {
                     self.bytes = self.bytes.saturating_add(text.len());
                     if self.bytes > MAX_TEXT {
+                        trace.error_detail =
+                            Some(format!("visible text exceeded MAX_TEXT={MAX_TEXT} bytes"));
                         return Err(Reason::Incomplete);
                     }
                     self.parts.entry(index).or_default().push_str(&text);
@@ -877,21 +1172,47 @@ impl VisibleText {
                 CanonicalEvent::Completed {
                     reason: FinishReason::Stop,
                     ..
-                } if !self.completed => self.completed = true,
-                CanonicalEvent::Completed { .. }
-                | CanonicalEvent::TextDelta { .. }
-                | CanonicalEvent::ToolCallDelta { .. } => {
+                } if !self.completed => {
+                    self.completed = true;
+                    self.finish_reason = Some("Stop".into());
+                }
+                CanonicalEvent::Completed { reason, .. } => {
+                    let already = self.completed;
+                    self.finish_reason = Some(format!("{reason:?}"));
+                    trace.error_detail = Some(format!(
+                        "unexpected Completed(reason={reason:?}, duplicate={already})"
+                    ));
                     return Err(Reason::Incomplete);
                 }
-                _ => {} // usage, metadata and reasoning are not fingerprint evidence
+                CanonicalEvent::TextDelta { index, .. } => {
+                    trace.error_detail = Some(format!(
+                        "rejected TextDelta(index={index}, completed={}, parts={})",
+                        self.completed,
+                        self.parts.len()
+                    ));
+                    return Err(Reason::Incomplete);
+                }
+                CanonicalEvent::ToolCallDelta { .. } => {
+                    trace.error_detail =
+                        Some("unexpected ToolCallDelta in fingerprint probe".into());
+                    return Err(Reason::Incomplete);
+                }
+                _ => {} // usage and metadata are not fingerprint evidence
             }
         }
         Ok(())
     }
 
-    fn finish(self) -> Result<String, Reason> {
+    fn finish(self, trace: &mut SampleTrace) -> Result<String, Reason> {
         let visible: String = self.parts.into_values().collect();
         if !self.completed || visible.trim().is_empty() {
+            trace.error_detail = Some(format!(
+                "stream ended incomplete: completed={} visible_chars={} reasoning_chars={} finish={:?}",
+                self.completed,
+                visible.trim().chars().count(),
+                self.reasoning_chars,
+                self.finish_reason
+            ));
             return Err(Reason::Incomplete);
         }
         Ok(visible)
@@ -1007,12 +1328,15 @@ mod tests {
             finish: FinishReason::Stop,
             expect_effort: Some("low"),
         };
-        assert_eq!(
-            execute(&stub, "key-id", "account-A", "gpt-6-sol", "low", "probe")
-                .await
-                .unwrap(),
-            "hello world"
-        );
+        let (reply, trace) =
+            execute_with_trace(&stub, "key-id", "account-A", "gpt-6-sol", "low", "probe").await;
+        assert_eq!(reply.unwrap(), "hello world");
+        assert_eq!(trace.batches, 1);
+        assert_eq!(trace.events, 1);
+        assert_eq!(trace.text_parts, 2);
+        assert_eq!(trace.text_chars, 11);
+        assert_eq!(trace.reasoning_chars, 11);
+        assert_eq!(trace.finish_reason.as_deref(), Some("Stop"));
         stub.expect_effort = None;
         assert_eq!(
             execute(&stub, "key-id", "account-A", "gpt-4o", "default", "probe")
@@ -1021,15 +1345,26 @@ mod tests {
             "hello world"
         );
         stub.finish = FinishReason::Length;
-        assert_eq!(
-            execute(&stub, "key-id", "account-A", "gpt-4o", "default", "probe").await,
-            Err(Reason::Incomplete)
-        );
+        let (err, err_trace) =
+            execute_with_trace(&stub, "key-id", "account-A", "gpt-4o", "default", "probe").await;
+        assert_eq!(err, Err(Reason::Incomplete));
+        assert_eq!(err_trace.finish_reason.as_deref(), Some("Length"));
+        assert!(err_trace.error_detail.unwrap().contains("Length"));
         assert_eq!(
             stub.calls.lock().unwrap().last().unwrap(),
             wire::MODEL_STREAM_CLOSE
         );
-        assert_eq!(VisibleText::default().finish(), Err(Reason::Incomplete));
+        let mut empty_trace = SampleTrace::default();
+        assert_eq!(
+            VisibleText::default().finish(&mut empty_trace),
+            Err(Reason::Incomplete)
+        );
+        assert!(
+            empty_trace
+                .error_detail
+                .unwrap()
+                .contains("completed=false")
+        );
     }
 
     #[tokio::test]
@@ -1069,8 +1404,42 @@ mod tests {
             }
         }
         assert_eq!(
-            account_info(&Disabled, "account-A").await,
-            Err(Reason::AccountUnavailable)
+            account_info(&Disabled, "account-A").await.unwrap_err().0,
+            Reason::AccountUnavailable
+        );
+    }
+
+    #[test]
+    fn account_identity_ignores_cookie_or_token_revision_bumps_but_detects_replacement() {
+        let base = AuthRuntimeAccount {
+            account_id: "acct_01".into(),
+            provider_id: "openai".into(),
+            credential_revision: 5,
+            name: "acct_01".into(),
+            email: Some("alice@example.com".into()),
+            upstream_user_id: Some("user-aaa".into()),
+            upstream_account_id: Some("org-111".into()),
+            plan_type: Some("team".into()),
+            authentication_kind: "oauth".into(),
+            enabled: true,
+            credential_state: "ready".into(),
+            has_refresh_token: true,
+            access_token_expires_at_ms: None,
+            next_refresh_at_ms: None,
+        };
+        let mut after_cookie = base.clone();
+        after_cookie.credential_revision = 6;
+        assert_eq!(
+            AccountIdentity::from_runtime(&base).fingerprint(),
+            AccountIdentity::from_runtime(&after_cookie).fingerprint()
+        );
+
+        let mut replaced = base.clone();
+        replaced.credential_revision = 6;
+        replaced.upstream_user_id = Some("user-bbb".into());
+        assert_ne!(
+            AccountIdentity::from_runtime(&base).fingerprint(),
+            AccountIdentity::from_runtime(&replaced).fingerprint()
         );
     }
 
@@ -1199,6 +1568,7 @@ mod tests {
     fn native_terminal_error_and_rate_limit_are_not_scored() {
         use gateway_plugin_sdk::call::model::WireEvent;
         let mut text = VisibleText::default();
+        let mut trace = SampleTrace::default();
         let event = ExecutionEvent::wire(WireEvent {
             protocol: "openai".into(),
             payload: WirePayload::Json {
@@ -1209,7 +1579,11 @@ mod tests {
                 raw_sse: None,
             },
         });
-        assert_eq!(text.push(event), Err(Reason::RateLimited));
+        assert_eq!(text.push(event, &mut trace), Err(Reason::RateLimited));
+        assert_eq!(
+            trace.wire_terminal.as_deref(),
+            Some("response.failed:rate_limit_exceeded")
+        );
         let mut e = PluginFault::new(ErrorCode::Capacity, "not evidence");
         e.details = Some(json!({"kind":"rate_limited"}));
         assert_eq!(safe_reason(&e), Reason::RateLimited);
@@ -1218,6 +1592,7 @@ mod tests {
     #[test]
     fn cancellation_and_edited_replies_are_not_evidence() {
         let mut txt = VisibleText::default();
+        let mut trace = SampleTrace::default();
         let event = ExecutionEvent {
             host: Some(Box::new(
                 gateway_plugin_sdk::call::model::facts::ExecutionFacts {
@@ -1227,7 +1602,13 @@ mod tests {
             )),
             ..Default::default()
         };
-        assert_eq!(txt.push(event), Err(Reason::Transformed));
+        assert_eq!(txt.push(event, &mut trace), Err(Reason::Transformed));
+        assert!(
+            trace
+                .error_detail
+                .unwrap()
+                .contains("middleware_transformed")
+        );
         assert_eq!(
             safe_reason(&PluginFault::new(ErrorCode::Cancelled, "don't surface me")),
             Reason::Cancelled

@@ -11,7 +11,16 @@ use std::{
 };
 
 const LOCK_BYTES: &[u8] = include_bytes!("../data/detector.lock.json");
-const POLICY: &str = "responses-openai-strict-rank-v2";
+const POLICY: &str = "responses-openai-strict-rank-v3";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScoreTrace {
+    pub decision: Option<String>,
+    pub used_outputs: Option<usize>,
+    pub probability_status: Option<String>,
+    pub candidate_count: usize,
+    pub detail: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct LockedAsset {
@@ -101,12 +110,11 @@ impl Fingerprint {
         Some((id.as_str(), display.as_str()))
     }
 
-    /// Binds a round and optional confirmation retest to the exact bank lock, request pair, and credential version.
-    pub fn round_stamp(&self, model: &str, effort: &str, credential_revision: u64) -> String {
+    /// Binds a round and optional confirmation retest to the exact bank lock, request pair, and stable upstream account identity.
+    pub fn round_stamp(&self, model: &str, effort: &str, identity_fingerprint: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(LOCK_BYTES);
-        let revision_text = credential_revision.to_string();
-        for field in [POLICY, model, effort, &revision_text] {
+        for field in [POLICY, model, effort, identity_fingerprint] {
             hasher.update([0]);
             hasher.update(field.as_bytes());
         }
@@ -124,12 +132,48 @@ impl Fingerprint {
         Ok(result)
     }
 
+    pub fn rank_with_trace(
+        &self,
+        outputs: &[Output],
+        stamp: String,
+    ) -> (Result<Round, Reason>, ScoreTrace) {
+        let analysis = match self.detector.analyze(outputs, true) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                return (
+                    Err(Reason::NotScorable),
+                    ScoreTrace {
+                        decision: Some("Error".into()),
+                        detail: Some(format!("lmfpd analyze error: {error}")),
+                        ..ScoreTrace::default()
+                    },
+                );
+            }
+        };
+        let mut trace = ScoreTrace {
+            decision: Some(format!("{:?}", analysis.decision)),
+            used_outputs: Some(analysis.used_outputs),
+            probability_status: Some(format!("{:?}", analysis.probability_status)),
+            candidate_count: analysis.results.len(),
+            detail: None,
+        };
+        let result = summarize(analysis, stamp, &self.revision);
+        if let Err(reason) = &result {
+            trace.detail = Some(format!(
+                "reason={reason:?} decision={} used_outputs={}/{} prob_status={} candidates={}",
+                trace.decision.as_deref().unwrap_or("?"),
+                trace.used_outputs.unwrap_or(0),
+                PROBES_PER_ROUND,
+                trace.probability_status.as_deref().unwrap_or("?"),
+                trace.candidate_count,
+            ));
+        }
+        (result, trace)
+    }
+
+    #[cfg(test)]
     pub fn rank(&self, outputs: &[Output], stamp: String) -> Result<Round, Reason> {
-        let analysis = self
-            .detector
-            .analyze(outputs, true)
-            .map_err(|_| Reason::NotScorable)?;
-        summarize(analysis, stamp, &self.revision)
+        self.rank_with_trace(outputs, stamp).0
     }
 }
 
@@ -231,8 +275,12 @@ mod tests {
             );
             assert_eq!(bank.expected_label("not-in-reference-bank"), None);
             assert_ne!(
-                bank.round_stamp("gpt-6-sol", "low", 1),
-                bank.round_stamp("gpt-6-sol", "high", 1)
+                bank.round_stamp("gpt-6-sol", "low", "openai|oauth|u:u1|a:a1"),
+                bank.round_stamp("gpt-6-sol", "high", "openai|oauth|u:u1|a:a1")
+            );
+            assert_ne!(
+                bank.round_stamp("gpt-6-sol", "low", "openai|oauth|u:u1|a:a1"),
+                bank.round_stamp("gpt-6-sol", "low", "openai|oauth|u:u2|a:a2")
             );
         }
         assert!(Fingerprint::load(Path::new("does-not-exist")).is_err());

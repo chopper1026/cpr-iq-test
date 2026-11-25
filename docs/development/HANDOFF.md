@@ -1,12 +1,12 @@
 # 阶段交接与验证快照
 
-证据日期：2026-11-25（Asia/Shanghai）。
+证据日期：2026-11-26（Asia/Shanghai）。
 
 本文记录当前多平台验证矩阵、分层证据与授权边界；软件项目不涉及硬件槽位字段。未执行层级均标为「未验证」，历史提交的局部通过不追认为全平台或当前构建通过。
 
 ## 当前状态与入口
 
-- **阶段目标**：修复线上 `v0.1.0-dev.1` 流解析 `Reason::Incomplete` 缺陷，移除 24 小时探针预算与校准模式限制，上线宿主全部模型与推理档位自动拉取、账号真实邮箱展示以及独立「任务记录」筛选分页 Tab 页，待推送并经 GitHub Actions 三平台构建验证后供线上升级。
+- **阶段目标**：修复线上 `v0.1.0-dev.2` 采样期间宿主捕获 `Set-Cookie` / OAuth 刷新导致 `credential_revision` 自增而被误判为 `AccountChanged` 的缺陷，并新增逐探针脱敏诊断明细与「任务记录 → 导出诊断日志 / 单条日志查看」能力，待本地完整验证后由管理员确认是否推送并发布 `v0.1.0-dev.3`。
 - **权威入口**：
   - 安装与日常使用：[README.md](../../README.md)
   - 隔离 smoke、自动跟版与回滚：[docs/release.md](../release.md)
@@ -15,12 +15,12 @@
   - 功能实现与分层证据：[FEATURES.md](FEATURES.md)
   - 开发治理导航：[INDEX.md](INDEX.md)
 - **当前主要待办与风险**：
-  1. 尚未执行线上真实 OAuth 账号的端到端模型目录拉取与指纹实跑验证（已通过宿主源码核对与单测/隔离 smoke 覆盖协议细节）。
-  2. 尚未推送至 GitHub 触发 Linux x86_64 / Linux ARM64 / macOS ARM64 三平台 CI 重建与 smoke。
+  1. 尚未将本次 `AccountIdentity` 修复与诊断日志导出提交推送并发布 `v0.1.0-dev.3`（需用户确认授权）。
+  2. 尚未在线上真实 OAuth 账号环境复测修复后的 `gpt-6.2-sol / high` 端到端评分与沙箱内一键复制导出日志。
 
 ## 构建与运行身份
 
-- **插件版本**：`0.1.0`（`plugin.json` 与 `Cargo.toml` 一致；本地验收包版本 `0.1.0-dev.2`）。
+- **插件版本**：`0.1.0`（`plugin.json` 与 `Cargo.toml` 一致；已发布最近预发布 `v0.1.0-dev.2` 于 `7f68bea`，本次本地验收包版本 `0.1.0-dev.3`）。
 - **锁定外部契约**：
   - 宿主目标：`zyycn/codex-proxy-rs` `v3.54.5`（commit `45a4d580c7e1ac2b2c0308d72ae5018148f2516a`，`engines.codex-proxy-rs: ~3.54.5`）。
   - 参考检测库：`Ikaleio/lm-detector` commit `e0472890bea827d15ca883636a77d4c10bbe843b`（`unified_bank.json` 与 `shared_detector.bin` 锁于 `data/detector.lock.json`）。

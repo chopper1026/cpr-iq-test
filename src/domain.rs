@@ -17,6 +17,58 @@ const RETENTION_MS: u64 = 30 * DAY_MS;
 pub struct AccountMeta {
     pub email: Option<String>,
     pub name: Option<String>,
+    pub plan_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeDiagnostic {
+    pub index: u8,
+    pub challenge_id: String,
+    pub expected_count: u64,
+    pub duration_ms: u64,
+    pub ok: bool,
+    pub batches: u32,
+    pub events: u32,
+    pub text_parts: u16,
+    pub text_chars: usize,
+    pub reasoning_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_terminal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_reason: Option<Reason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunDiagnostic {
+    pub round: u8,
+    pub stage: String,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_revision_before: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_revision_after: Option<u64>,
+    #[serde(default)]
+    pub identity_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_outputs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probability_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<ProbeDiagnostic>,
 }
 
 fn default_effort() -> String {
@@ -373,6 +425,8 @@ pub struct HistoryItem {
     pub plugin_version: String,
     pub first_round: Option<Round>,
     pub outcome: Outcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<RunDiagnostic>,
 }
 
 impl HistoryItem {
@@ -567,6 +621,7 @@ impl State {
                 now,
                 version,
                 None,
+                None,
             );
         }
     }
@@ -587,6 +642,7 @@ impl State {
         now: u64,
         version: &str,
         refreshed_meta: Option<AccountMeta>,
+        diagnostics: Option<RunDiagnostic>,
     ) {
         let Some(index) = self.queue.iter().position(|q| {
             q.claimed
@@ -607,7 +663,7 @@ impl State {
         }
         match decision {
             Decision::Finish(outcome) => {
-                self.finish_at(index, outcome, now, version, refreshed_meta)
+                self.finish_at(index, outcome, now, version, refreshed_meta, diagnostics)
             }
             Decision::Confirm(round) => {
                 self.queue[index].first_round = Some(round);
@@ -623,6 +679,7 @@ impl State {
                         now,
                         version,
                         refreshed_meta,
+                        diagnostics,
                     );
                 } else {
                     self.queue[index].claimed = false;
@@ -645,6 +702,7 @@ impl State {
                 at,
                 version,
                 None,
+                None,
             );
         }
     }
@@ -656,6 +714,7 @@ impl State {
         now: u64,
         version: &str,
         refreshed_meta: Option<AccountMeta>,
+        diagnostics: Option<RunDiagnostic>,
     ) {
         let task = self.queue.remove(index);
         let account_email = refreshed_meta
@@ -681,6 +740,7 @@ impl State {
                 plugin_version: version.to_owned(),
                 first_round: task.first_round,
                 outcome,
+                diagnostics,
             },
         );
         self.history.truncate(MAX_HISTORY);
@@ -788,6 +848,7 @@ mod tests {
             AccountMeta {
                 email: Some("alice@example.com".into()),
                 name: Some("Alice".into()),
+                plan_type: Some("pro".into()),
             },
         )]);
         s.enqueue_manual("m-batch001".into(), target(&["A", "B"]), 0, &labels)
@@ -855,6 +916,7 @@ mod tests {
             Decision::Confirm(round(&["B", "C", "D"], 1200)),
             2 * DAY_MS + 3,
             "v",
+            None,
             None,
         );
         assert!(s.queue.is_empty());

@@ -109,6 +109,7 @@
         </div>
         <div class="records-actions">
           <button type="button" class="secondary danger-outline" id="cancel-pending" hidden>取消排队任务</button>
+          <button type="button" class="secondary" id="export-logs">导出诊断日志</button>
           <button type="button" class="secondary" id="refresh-records">刷新列表</button>
         </div>
       </div>
@@ -165,6 +166,7 @@
               <th scope="col">状态与结论</th>
               <th scope="col">候选指纹排名（Top 3）</th>
               <th scope="col">时间</th>
+              <th scope="col">操作</th>
             </tr>
           </thead>
           <tbody id="rows"></tbody>
@@ -184,6 +186,38 @@
           <div class="page-buttons" id="page-buttons"></div>
         </div>
       </div>
+    </section>
+
+    <section class="card log-drawer" id="log-drawer" aria-labelledby="log-drawer-title" hidden>
+      <div class="log-drawer-head">
+        <div>
+          <h2 id="log-drawer-title">诊断日志导出</h2>
+          <p class="muted" id="log-drawer-sub">不包含 OAuth Token、Cookie、Client Key 明文或原始对话正文，可直接用于故障排查。</p>
+        </div>
+        <div class="log-drawer-controls">
+          <select id="log-scope" aria-label="导出范围">
+            <option value="filtered">当前筛选记录</option>
+            <option value="all">全部任务与运行日志</option>
+          </select>
+          <select id="log-format" aria-label="导出格式">
+            <option value="json">JSON 完整日志</option>
+            <option value="text">纯文本诊断摘要</option>
+          </select>
+          <button type="button" class="secondary" id="log-refresh">重新采集</button>
+          <button type="button" class="secondary" id="log-close">关闭</button>
+        </div>
+      </div>
+
+      <div id="log-visual" class="log-visual" hidden></div>
+
+      <div class="log-export-bar">
+        <button type="button" id="log-copy">一键复制日志</button>
+        <button type="button" class="secondary" id="log-select">全选内容</button>
+        <button type="button" class="secondary" id="log-download" hidden>下载日志文件</button>
+        <span class="muted log-notice" id="log-notice" role="status"></span>
+      </div>
+
+      <textarea id="log-output" class="log-textarea mono" readonly spellcheck="false" aria-label="诊断日志内容"></textarea>
     </section>
   </section>
 
