@@ -231,7 +231,11 @@ jobs:
 
   rebuild:
     needs: [discover, decide]
-    if: needs.decide.outputs.route == 'rebuild' || needs.decide.outputs.route == 'manifest-only'
+    if: >-
+      always() &&
+      needs.discover.result == 'success' &&
+      needs.decide.result == 'success' &&
+      (needs.decide.outputs.route == 'rebuild' || needs.decide.outputs.route == 'manifest-only')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 55
     strategy:

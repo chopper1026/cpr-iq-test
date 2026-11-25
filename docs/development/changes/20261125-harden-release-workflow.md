@@ -19,6 +19,7 @@
 
 - [follow_host.py](../../../scripts/follow_host.py) 为 `api()` 与 `download()` 的重试循环补上 `http.client.HTTPException` 捕获，避免 `IncompleteRead` 绕过重试；补充 `download_release_asset()` 并在跨域重定向时剥离 `Authorization` 头。
 - [release_gate.py](../../../scripts/release_gate.py) 在 `gh release create --draft` 与转正之间核对全部 5 份远端附件大小和 SHA-256（缺失 API 摘要时下载回算），拦截残留草稿重名，并对已发布的同提交同摘要 Release 支持幂等补写兼容表。
+- [follow-host.yml](../../../.github/workflows/follow-host.yml) 为 `rebuild` 任务显式使用 `always() && needs.discover.result == 'success' && needs.decide.result == 'success'`，修复 `old` 被跳过时 GitHub Actions 传递性 `success()` 为假导致 `rebuild` 被误跳过的问题（实跑 run `45629428949` 检出）。
 
 ### 性能优化
 
