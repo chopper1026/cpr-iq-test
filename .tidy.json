@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "project": "cpr-iq-test",
+  "commit_policy": "new",
+  "commit_guide": "docs/development/COMMIT_CONVENTION.md",
+  "docs_root": "docs/development",
+  "catalog_roots": [
+    "docs"
+  ],
+  "architecture": "docs/development/ARCHITECTURE.md",
+  "features": "docs/development/FEATURES.md",
+  "records_root": "docs/development/changes",
+  "process_root": "docs/development",
+  "history_visibility": "tracked",
+  "catalog": {
+    "asset_mode": "grouped",
+    "categories": [
+      {
+        "title": "使用、交付与回滚",
+        "patterns": ["docs/README.md", "docs/release.md"]
+      },
+      {
+        "title": "现行开发规范与契约",
+        "patterns": [
+          "docs/development/INDEX.md",
+          "docs/development/COMMIT_CONVENTION.md",
+          "docs/development/ARCHITECTURE.md",
+          "docs/development/FEATURES.md"
+        ]
+      }
+    ]
+  },
+  "legacy_docs": {
+    "strategy": "preserve",
+    "status": "preserved"
+  },
+  "gitnexus": {
+    "enabled": false,
+    "mode": "index-only"
+  },
+  "document_checks": {
+    "markdown": [
+      "README.md",
+      "THIRD_PARTY.md",
+      "AGENTS.md",
+      "docs/README.md",
+      "docs/release.md",
+      "docs/development/*.md"
+    ],
+    "exclude": ["docs/development/changes/*"],
+    "json": [".tidy.json", "plugin.json", "data/detector.lock.json", "data/profiles.json"],
+    "references": [
+      {"document": "README.md", "target": "scripts/detector_assets.py"},
+      {"document": "README.md", "target": "scripts/package.py"},
+      {"document": "README.md", "target": ".github/workflows/follow-host.yml"},
+      {"document": "THIRD_PARTY.md", "target": "LICENSE-lm-detector"},
+      {"document": "THIRD_PARTY.md", "target": "data/detector.lock.json"},
+      {"document": "THIRD_PARTY.md", "target": "Cargo.lock"},
+      {"document": "docs/release.md", "target": "data/profiles.json"},
+      {"document": "docs/release.md", "target": "scripts/smoke_host.py"},
+      {"document": "docs/release.md", "target": "tests/known_other.json"}
+    ]
+  },
+  "governance": {
+    "revision": 5,
+    "fingerprint": "528e481f57f68e1d4148a75f5a3d4e94b3ec80ee522da50d3b19ac3e909cffd2",
+    "managed_hashes": {
+      "AGENTS.md": "110297d103eeb11bcce7b0862335d2133adcdb2671d60d6bf7d57e384ad1609a"
+    },
+    "scope": "managed-blocks-only"
+  }
+}

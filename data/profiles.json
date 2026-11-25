@@ -1,0 +1,9 @@
+[
+  {
+    "id": "gpt6-sol-low",
+    "model": "gpt-6-sol",
+    "effort": "low",
+    "labelId": "gpt-6-sol",
+    "validation": null
+  }
+]

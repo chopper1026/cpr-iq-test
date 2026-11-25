@@ -1,0 +1,254 @@
+name: Verify new CPR stable releases
+
+on:
+  schedule:
+    - cron: '9,39 * * * *'
+  workflow_dispatch:
+    inputs:
+      host_tag:
+        description: 'Stable CPR tag to (re)verify, e.g. v3.54.5. Empty uses the current stable release.'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+concurrency:
+  group: cpr-stable-release
+  cancel-in-progress: false
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_TERM_COLOR: 'never'
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      host_sha: ${{ steps.plan.outputs.host_sha }}
+      host_tag: ${{ steps.plan.outputs.host_tag }}
+      rust: ${{ steps.plan.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - id: plan
+        name: Read the stable release and freeze its source and contracts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_HOST: ${{ inputs.host_tag }}
+        run: python scripts/follow_host.py discover --repository "$GITHUB_REPOSITORY" --tag "$REQUESTED_HOST" --work .work/ci --output .work/plan.json --github-output "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.skip != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: host-plan
+          include-hidden-files: true
+          path: .work/plan.json
+          if-no-files-found: error
+
+  host-contract:
+    needs: discover
+    if: needs.discover.outputs.skip == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      HOST_SHA: ${{ needs.discover.outputs.host_sha }}
+      RUST: ${{ needs.discover.outputs.rust }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/host-contract
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v7
+        with:
+          name: host-plan
+          path: .work/plan
+      - name: Check source and install the exact host toolchain
+        run: |
+          python -c 'import sys; sys.path.insert(0,"scripts"); from follow_host import read_json, host_source; from pathlib import Path; import os; plan=read_json(".work/plan/plan.json"); assert not plan["contract"]["problems"], plan["contract"]["problems"]; host_source(os.environ["HOST_SHA"], Path(".work/ci"))'
+          rustup toolchain install "$RUST" --profile minimal
+      - name: Verify Core cannot switch away from a required account
+        run: bash scripts/check_bound_host.sh ".work/ci/source/codex-proxy-rs-$HOST_SHA" "$RUST"
+      - name: Verify the plugin's wire and evidence contracts
+        run: |
+          python scripts/detector_assets.py
+          CPR_REQUIRE_BANK=1 cargo +"$RUST" test --locked --all-targets
+          python -m unittest discover -s tests -p 'test_*.py'
+
+  old:
+    needs: discover
+    if: needs.discover.outputs.skip == 'false'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, triple: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
+          - { runner: macos-15, triple: aarch64-apple-darwin }
+    env:
+      TRIPLE: ${{ matrix.triple }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v7
+        with:
+          name: host-plan
+          path: .work/plan
+      - name: Install isolated test database prerequisites when an old package exists
+        run: |
+          if jq -e '.previous and (.contract.problems | length == 0)' .work/plan/plan.json > /dev/null; then
+            bash scripts/ci_native_deps.sh
+          fi
+      - name: Verify whether the old package still installs and runs
+        run: python scripts/release_gate.py old --plan .work/plan/plan.json --triple "$TRIPLE" --work .work/ci --output .work/results
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: old-${{ matrix.triple }}
+          include-hidden-files: true
+          path: |
+            .work/results/outcome.json
+            .work/ci/smoke.log
+          if-no-files-found: warn
+
+  decide:
+    needs: [discover, old, host-contract]
+    if: always() && needs.discover.outputs.skip == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      route: ${{ steps.verdict.outputs.route }}
+      decision_artifact: ${{ steps.verdict.outputs.decision_artifact }}
+    steps:
+      - name: Fail closed on missing platform results or contract tests
+        env:
+          OLD: ${{ needs.old.result }}
+          CONTRACT: ${{ needs.host-contract.result }}
+        run: test "$OLD" = success && test "$CONTRACT" = success
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v7
+        with:
+          name: host-plan
+          path: .work/plan
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: old-*
+          path: .work/outcomes
+      - id: verdict
+        name: Choose verified reuse, rebuild, or block
+        run: |
+          python scripts/release_gate.py decide --plan .work/plan/plan.json --input .work/outcomes --output .work/decision.json --github-output "$GITHUB_OUTPUT"
+          echo "decision_artifact=release-decision" >> "$GITHUB_OUTPUT"
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-decision
+          include-hidden-files: true
+          path: .work/decision.json
+          if-no-files-found: ignore
+
+  rebuild:
+    needs: [discover, decide]
+    if: needs.decide.outputs.route == 'rebuild' || needs.decide.outputs.route == 'manifest-only'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, triple: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu }
+          - { runner: macos-15, triple: aarch64-apple-darwin }
+    env:
+      TRIPLE: ${{ matrix.triple }}
+      RUST: ${{ needs.discover.outputs.rust }}
+      ROUTE: ${{ needs.decide.outputs.route }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v7
+        with:
+          name: host-plan
+          path: .work/plan
+      - name: Install native toolchain and isolated services
+        run: |
+          rustup toolchain install "$RUST" --profile minimal
+          bash scripts/ci_native_deps.sh
+      - name: Build and validate a new version on a real host
+        run: |
+          options=()
+          if [[ "$ROUTE" == manifest-only ]]; then options+=(--manifest-only); fi
+          python scripts/release_gate.py build --plan .work/plan/plan.json --triple "$TRIPLE" --work .work/ci --output dist "${options[@]}"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: candidate-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rebuild-log-${{ matrix.triple }}
+          include-hidden-files: true
+          path: .work/ci/smoke.log
+          if-no-files-found: ignore
+
+  publish:
+    needs: [discover, decide, rebuild]
+    if: >-
+      always() && vars.CPR_ENABLE_PUBLISH == 'true' && github.ref_name == github.event.repository.default_branch &&
+      needs.decide.result == 'success' &&
+      ((needs.decide.outputs.route == 'reuse' && needs.rebuild.result == 'skipped') || needs.rebuild.result == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v7
+        with:
+          name: host-plan
+          path: .work/plan
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.decide.outputs.decision_artifact }}
+          path: .work/decision
+      - if: needs.rebuild.result == 'success'
+        uses: actions/download-artifact@v7
+        with:
+          pattern: candidate-*
+          path: .work/candidates
+      - name: Publish verified packages or only record reuse (no production deployment)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CPR_ENABLE_PUBLISH: ${{ vars.CPR_ENABLE_PUBLISH }}
+        run: >-
+          python scripts/release_gate.py publish --plan .work/plan/plan.json
+          --decision .work/decision/decision.json --input .work/candidates
+          --output .work/publish --source "$GITHUB_SHA" --write

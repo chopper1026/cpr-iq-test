@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>账号指纹巡检</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+<main>
+  <div class="overview">
+    <div>
+      <p class="eyebrow">OpenAI · OAuth</p>
+      <h1>模型指纹检查</h1>
+      <p class="muted">检测只使用指定账号，结果不改变账号状态或路由。指纹是与参考库的比较，不是智力评分或身份认证。</p>
+    </div>
+    <button class="secondary" type="button" id="refresh">刷新</button>
+  </div>
+  <p id="accessible-status" class="message" role="status" aria-live="polite">正在读取插件状态…</p>
+  <dl class="summary">
+    <div><dt>24 小时剩余探针预算</dt><dd id="remaining">—</dd></div>
+    <div><dt>队列</dt><dd id="queue-count">—</dd></div>
+    <div><dt>下次巡检</dt><dd class="date" id="due">—</dd></div>
+  </dl>
+  <p id="last-skip" class="message" hidden></p>
+  <div class="panels">
+    <section class="card" aria-labelledby="manual-title">
+      <h2 id="manual-title">手动检测</h2>
+      <p class="muted" id="profile-note">选择测试 Key、模型档位和账号，每批最多 10 个。</p>
+      <form id="manual" novalidate>
+        <label>模式<select id="mode"><option value="detect">指纹检测</option><option value="calibration">校准（仅排名，不判定）</option></select></label>
+        <div id="manual-target"></div>
+        <p class="estimate" id="manual-cost">预计调用：—</p>
+        <button type="submit" id="submit-run" disabled>加入队列</button>
+        <p class="muted notice" id="manual-notice" role="status"></p>
+      </form>
+    </section>
+    <section class="card" aria-labelledby="schedule-title">
+      <h2 id="schedule-title">定时巡检</h2>
+      <p class="muted">默认关闭。没有足够预算时跳过，不补跑积压任务。</p>
+      <form id="schedule" novalidate>
+        <label class="switch"><input id="enabled" type="checkbox">启用定时巡检</label>
+        <div class="fields">
+          <label>巡检间隔<select id="hours"><option value="24">24 小时</option><option value="48">48 小时</option><option value="168">7 天</option></select></label>
+          <label>共享预算（次／24 小时）<input id="budget" type="number" min="3" max="60" step="1" value="60"></label>
+        </div>
+        <div id="schedule-target"></div>
+        <p class="estimate" id="schedule-cost">预计调用：—</p>
+        <button class="secondary" type="submit" id="save" disabled>保存巡检设置</button>
+        <p class="muted notice" id="schedule-notice" role="status"></p>
+      </form>
+    </section>
+  </div>
+  <section class="card log" aria-labelledby="log-title">
+    <div class="log-head"><div><h2 id="log-title">任务与检测记录</h2><p class="muted">只保存结果摘要，最多 100 条、30 天。时间按浏览器时区显示。</p></div></div>
+    <p class="empty" id="empty">正在加载…</p>
+    <div class="scroll" id="table-wrap" hidden>
+      <table>
+        <caption class="sr-only">正在排队的检测和最近检测结果</caption>
+        <thead><tr><th scope="col">账号</th><th scope="col">模型档位</th><th scope="col">状态</th><th scope="col">候选排名</th><th scope="col">时间</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+  <footer id="version" class="muted"></footer>
+</main>
+</body>
+</html>

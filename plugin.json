@@ -1,0 +1,36 @@
+{
+  "manifestVersion": 2,
+  "publisher": "cpr-iq-test",
+  "name": "account-fingerprint",
+  "displayName": "Codex 账号指纹巡检",
+  "version": "0.1.0",
+  "description": "指定账号的模型参考指纹检测，不改变账号状态或路由。",
+  "license": "Apache-2.0",
+  "engines": { "codex-proxy-rs": "~3.54.5" },
+  "main": "bin/plugin",
+  "runtime": "trustedProcess",
+  "contributes": {
+    "management": { "version": 2 },
+    "maintenance": { "version": 1 }
+  },
+  "resources": {
+    "web/index.html": "text/html",
+    "web/style.css": "text/css",
+    "web/app.js": "text/javascript",
+    "data/unified_bank.json": "application/octet-stream",
+    "data/shared_detector.bin": "application/octet-stream",
+    "LICENSE": "text/plain",
+    "THIRD_PARTY.md": "text/plain",
+    "LICENSE-lm-detector": "text/plain"
+  },
+  "state": [
+    {
+      "namespace": "iq-test",
+      "schemaVersion": 1,
+      "schema": { "type": "object", "additionalProperties": false, "required": ["document"], "properties": { "document": { "type": "string", "maxLength": 59392 } } },
+      "maximumRecords": 1,
+      "maximumBytes": 65536,
+      "maximumValueBytes": 61440
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+/.work/
+/target/
+/dist/
+/data/unified_bank.json
+/data/shared_detector.bin
+__pycache__/
+.DS_Store
+
+/output/playwright/
+/.playwright-cli/
+# tidy local state
+/docs/local/tidy/
+/.gitnexus/

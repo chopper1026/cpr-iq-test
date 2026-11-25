@@ -1,0 +1,33 @@
+name: Early warning against CPR main
+
+on:
+  schedule:
+    - cron: '17 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Resolve main to a commit, compare APIs and compile only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+        run: python scripts/follow_host.py main --work .work/main --output .work/main/contract.json --compile
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: main-contract
+          include-hidden-files: true
+          path: .work/main/contract.json
+          if-no-files-found: ignore

@@ -1,0 +1,14 @@
+{
+  "repository": "Ikaleio/lm-detector",
+  "revision": "e0472890bea827d15ca883636a77d4c10bbe843b",
+  "files": {
+    "unified_bank.json": {
+      "bytes": 15275823,
+      "sha256": "06397f4ed64911abab9f3b05843f5e87fc92057040aa9aa43bc6f16eb242b1aa"
+    },
+    "shared_detector.bin": {
+      "bytes": 5514204,
+      "sha256": "5ce8f55a6bed741c3ef2c3d9929832df949639d249834aabea168773136fd9e2"
+    }
+  }
+}
