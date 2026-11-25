@@ -9,6 +9,21 @@ on:
         description: 'Stable CPR tag to (re)verify, e.g. v3.54.5. Empty uses the current stable release.'
         type: string
         required: false
+      dry_run:
+        description: 'Verify and build artifacts without creating a GitHub Release or updating cpr-compatibility.'
+        type: boolean
+        required: false
+        default: false
+      prerelease:
+        description: 'Build a -dev.N preview version and publish it as a GitHub Prerelease (never writes cpr-compatibility or occupies a stable tag).'
+        type: boolean
+        required: false
+        default: false
+      resume_run_id:
+        description: 'Prior follow-host.yml run ID at the same commit to resume verification/publish from without rebuilding.'
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -22,6 +37,9 @@ env:
 
 jobs:
   discover:
+    if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.resume_run_id == '') &&
+      (github.event_name != 'schedule' || vars.CPR_ENABLE_PUBLISH == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     outputs:
@@ -29,6 +47,9 @@ jobs:
       host_sha: ${{ steps.plan.outputs.host_sha }}
       host_tag: ${{ steps.plan.outputs.host_tag }}
       rust: ${{ steps.plan.outputs.rust }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      contract_ok: ${{ steps.plan.outputs.contract_ok }}
+      has_previous: ${{ steps.plan.outputs.has_previous }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -41,7 +62,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_HOST: ${{ inputs.host_tag }}
-        run: python scripts/follow_host.py discover --repository "$GITHUB_REPOSITORY" --tag "$REQUESTED_HOST" --work .work/ci --output .work/plan.json --github-output "$GITHUB_OUTPUT"
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+        run: |
+          options=()
+          if [ "$PRERELEASE" = "true" ]; then
+            options+=(--prerelease)
+          fi
+          python scripts/follow_host.py discover --repository "$GITHUB_REPOSITORY" --tag "$REQUESTED_HOST" --work .work/ci --output .work/plan.json --github-output "$GITHUB_OUTPUT" "${options[@]}"
       - if: steps.plan.outputs.skip != 'true'
         uses: actions/upload-artifact@v6
         with:
@@ -52,7 +79,7 @@ jobs:
 
   host-contract:
     needs: discover
-    if: needs.discover.outputs.skip == 'false'
+    if: needs.discover.outputs.skip == 'false' && needs.discover.outputs.contract_ok == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -70,6 +97,25 @@ jobs:
         with:
           name: host-plan
           path: .work/plan
+      - name: Restore locked detector data cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            data/unified_bank.json
+            data/shared_detector.bin
+          key: detector-assets-${{ hashFiles('data/detector.lock.json') }}
+      - name: Restore Cargo build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/host-contract
+          key: cargo-contract-${{ runner.os }}-${{ runner.arch }}-${{ needs.discover.outputs.rust }}-${{ needs.discover.outputs.host_sha }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-contract-${{ runner.os }}-${{ runner.arch }}-${{ needs.discover.outputs.rust }}-${{ needs.discover.outputs.host_sha }}-
+            cargo-contract-${{ runner.os }}-${{ runner.arch }}-${{ needs.discover.outputs.rust }}-
       - name: Check source and install the exact host toolchain
         run: |
           python -c 'import sys; sys.path.insert(0,"scripts"); from follow_host import read_json, host_source; from pathlib import Path; import os; plan=read_json(".work/plan/plan.json"); assert not plan["contract"]["problems"], plan["contract"]["problems"]; host_source(os.environ["HOST_SHA"], Path(".work/ci"))'
@@ -84,7 +130,10 @@ jobs:
 
   old:
     needs: discover
-    if: needs.discover.outputs.skip == 'false'
+    if: >-
+      needs.discover.outputs.skip == 'false' &&
+      needs.discover.outputs.contract_ok == 'true' &&
+      needs.discover.outputs.has_previous == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     strategy:
@@ -126,7 +175,7 @@ jobs:
 
   decide:
     needs: [discover, old, host-contract]
-    if: always() && needs.discover.outputs.skip == 'false'
+    if: always() && needs.discover.result == 'success' && needs.discover.outputs.skip == 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -135,9 +184,17 @@ jobs:
     steps:
       - name: Fail closed on missing platform results or contract tests
         env:
+          CONTRACT_OK: ${{ needs.discover.outputs.contract_ok }}
+          HAS_PREVIOUS: ${{ needs.discover.outputs.has_previous }}
           OLD: ${{ needs.old.result }}
           CONTRACT: ${{ needs.host-contract.result }}
-        run: test "$OLD" = success && test "$CONTRACT" = success
+        run: |
+          if [ "$CONTRACT_OK" = "true" ]; then
+            test "$CONTRACT" = "success"
+            if [ "$HAS_PREVIOUS" = "true" ]; then
+              test "$OLD" = "success"
+            fi
+          fi
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -148,14 +205,21 @@ jobs:
         with:
           name: host-plan
           path: .work/plan
-      - uses: actions/download-artifact@v7
+      - if: needs.old.result == 'success'
+        uses: actions/download-artifact@v7
         with:
           pattern: old-*
           path: .work/outcomes
       - id: verdict
         name: Choose verified reuse, rebuild, or block
+        env:
+          REQUIRE_VALIDATED: ${{ vars.CPR_ENABLE_PUBLISH == 'true' && github.ref_name == github.event.repository.default_branch && !inputs.dry_run && needs.discover.outputs.prerelease != 'true' }}
         run: |
-          python scripts/release_gate.py decide --plan .work/plan/plan.json --input .work/outcomes --output .work/decision.json --github-output "$GITHUB_OUTPUT"
+          options=()
+          if [ "$REQUIRE_VALIDATED" = "true" ]; then
+            options+=(--require-validated)
+          fi
+          python scripts/release_gate.py decide --plan .work/plan/plan.json --input .work/outcomes --output .work/decision.json --github-output "$GITHUB_OUTPUT" "${options[@]}"
           echo "decision_artifact=release-decision" >> "$GITHUB_OUTPUT"
       - if: always()
         uses: actions/upload-artifact@v6
@@ -192,6 +256,26 @@ jobs:
         with:
           name: host-plan
           path: .work/plan
+      - name: Restore locked detector data cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            data/unified_bank.json
+            data/shared_detector.bin
+          key: detector-assets-${{ hashFiles('data/detector.lock.json') }}
+      - name: Restore Cargo build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/plugin
+            target/cpr-cli
+          key: cargo-rebuild-${{ matrix.triple }}-${{ needs.discover.outputs.rust }}-${{ needs.discover.outputs.host_sha }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-rebuild-${{ matrix.triple }}-${{ needs.discover.outputs.rust }}-${{ needs.discover.outputs.host_sha }}-
+            cargo-rebuild-${{ matrix.triple }}-${{ needs.discover.outputs.rust }}-
       - name: Install native toolchain and isolated services
         run: |
           rustup toolchain install "$RUST" --profile minimal
@@ -214,16 +298,16 @@ jobs:
           path: .work/ci/smoke.log
           if-no-files-found: ignore
 
-  publish:
-    needs: [discover, decide, rebuild]
-    if: >-
-      always() && vars.CPR_ENABLE_PUBLISH == 'true' && github.ref_name == github.event.repository.default_branch &&
-      needs.decide.result == 'success' &&
-      ((needs.decide.outputs.route == 'reuse' && needs.rebuild.result == 'skipped') || needs.rebuild.result == 'success')
+  resume-verify:
+    if: github.event_name == 'workflow_dispatch' && inputs.resume_run_id != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
+      actions: read
+    outputs:
+      route: ${{ steps.resume.outputs.route }}
+      needs_candidates: ${{ steps.resume.outputs.needs_candidates }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -231,24 +315,150 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Verify resumed run provenance before downloading artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: >-
+          python scripts/release_gate.py verify-resume
+          --repository "$GITHUB_REPOSITORY" --run-id "$RESUME_RUN_ID"
+          --source "$GITHUB_SHA" --default-branch "$DEFAULT_BRANCH"
       - uses: actions/download-artifact@v7
         with:
           name: host-plan
           path: .work/plan
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
       - uses: actions/download-artifact@v7
         with:
-          name: ${{ needs.decide.outputs.decision_artifact }}
+          name: release-decision
           path: .work/decision
-      - if: needs.rebuild.result == 'success'
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+      - id: resume
+        name: Verify upstream jobs for resumed route
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: >-
+          python scripts/release_gate.py verify-resume
+          --repository "$GITHUB_REPOSITORY" --run-id "$RESUME_RUN_ID"
+          --source "$GITHUB_SHA" --default-branch "$DEFAULT_BRANCH"
+          --decision .work/decision/decision.json --github-output "$GITHUB_OUTPUT"
+      - if: steps.resume.outputs.needs_candidates == 'true'
         uses: actions/download-artifact@v7
         with:
           pattern: candidate-*
           path: .work/candidates
-      - name: Publish verified packages or only record reuse (no production deployment)
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+      - name: Dry-run verify resumed artifacts and digests
         env:
           GH_TOKEN: ${{ github.token }}
-          CPR_ENABLE_PUBLISH: ${{ vars.CPR_ENABLE_PUBLISH }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
         run: >-
           python scripts/release_gate.py publish --plan .work/plan/plan.json
           --decision .work/decision/decision.json --input .work/candidates
-          --output .work/publish --source "$GITHUB_SHA" --write
+          --output .work/publish --source "$GITHUB_SHA" --resume-run-id "$RESUME_RUN_ID"
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: resume-verify-receipt
+          include-hidden-files: true
+          path: |
+            .work/publish/publish-receipt.json
+            .work/publish/verification.json
+          if-no-files-found: ignore
+
+  publish:
+    needs: [discover, decide, rebuild, resume-verify]
+    if: >-
+      always() && !inputs.dry_run &&
+      github.ref_name == github.event.repository.default_branch && (
+        vars.CPR_ENABLE_PUBLISH == 'true' ||
+        (github.event_name == 'workflow_dispatch' && inputs.prerelease)
+      ) && (
+        ((github.event_name != 'workflow_dispatch' || inputs.resume_run_id == '') &&
+          needs.decide.result == 'success' &&
+          ((needs.decide.outputs.route == 'reuse' && needs.rebuild.result == 'skipped') || needs.rebuild.result == 'success')) ||
+        (github.event_name == 'workflow_dispatch' && inputs.resume_run_id != '' && needs.resume-verify.result == 'success')
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - if: github.event_name != 'workflow_dispatch' || inputs.resume_run_id == ''
+        uses: actions/download-artifact@v7
+        with:
+          name: host-plan
+          path: .work/plan
+      - if: github.event_name != 'workflow_dispatch' || inputs.resume_run_id == ''
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.decide.outputs.decision_artifact }}
+          path: .work/decision
+      - if: (github.event_name != 'workflow_dispatch' || inputs.resume_run_id == '') && needs.rebuild.result == 'success'
+        uses: actions/download-artifact@v7
+        with:
+          pattern: candidate-*
+          path: .work/candidates
+      - if: github.event_name == 'workflow_dispatch' && inputs.resume_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: host-plan
+          path: .work/plan
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+      - if: github.event_name == 'workflow_dispatch' && inputs.resume_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: release-decision
+          path: .work/decision
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+      - if: github.event_name == 'workflow_dispatch' && inputs.resume_run_id != '' && needs.resume-verify.outputs.needs_candidates == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          pattern: candidate-*
+          path: .work/candidates
+          run-id: ${{ inputs.resume_run_id }}
+          github-token: ${{ github.token }}
+      - name: Publish verified packages, prerelease preview, or record reuse (no production deployment)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CPR_ENABLE_PUBLISH: ${{ vars.CPR_ENABLE_PUBLISH }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          ALLOW_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+        run: |
+          options=(
+            --plan .work/plan/plan.json
+            --decision .work/decision/decision.json
+            --input .work/candidates
+            --output .work/publish
+            --source "$GITHUB_SHA"
+            --resume-run-id "$RESUME_RUN_ID"
+            --write
+          )
+          if [ "$ALLOW_PRERELEASE" = "true" ]; then
+            options+=(--allow-prerelease)
+          fi
+          python scripts/release_gate.py publish "${options[@]}"
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: publish-receipt
+          include-hidden-files: true
+          path: |
+            .work/publish/publish-receipt.json
+            .work/publish/verification.json
+          if-no-files-found: ignore

@@ -28,10 +28,13 @@ Smoke 验证真实宿主上传、信任、启用、目录和静态资源、私�
 
 ## 3. 启用自动跟版
 
-1. 将项目放到自己的 GitHub 仓库默认分支，确保有 GitHub 托管的 Linux x86_64、Linux ARM64 和 macOS ARM64 runners。保持仓库变量 `CPR_ENABLE_PUBLISH` 未设置，先运行 **Verify new CPR stable releases**；可以指定 `v3.54.5`。不需要生产凭据。第一次没有旧包，应走三平台重建；开发候选只作为 run artifacts 下载。
-2. 查看 `host-plan`、三平台输出、`release-decision` 与失败日志。脚本锁定正式 tag 和 commit，核对宿主二进制中的发布声明与源代码清单。旧包若覆盖目标版本并全部通过则复用；仅 `engines` 不覆盖、SDK 未变则重建清单；有兼容 SDK 变化则重编并再验。协议、必需能力、验收或摘要失败均禁止发布。兼容区间的下限是实际验证的宿主，不跨次版本声明支持。
-3. 完成授权模型验证并提交证据后，维护者再设置仓库变量 `CPR_ENABLE_PUBLISH=true`。仅默认分支发布任务具备 `contents: write`。它使用未使用过的插件补丁版本，上传三个包、`checksums.txt` 和 `verification.json`；成功后才写兼容表，不覆盖任何已发布文件。`cpr-compatibility` 分支中的 `compatibility/vX.Y.Z.json` 是该宿主 tag 的验证记录，包含宿主 commit、插件版本、平台和 SHA-256。若发布后写表失败，下一次检查会先尝试复验、复用已发布包。
-4. **Early warning against CPR main** 只做合同比较、编译和测试。遇到接口变更，修 `src/host.rs` 或 `src/service.rs` 的宿主接入，确认私有状态兼容；不需要修改探针或指纹策略来追宿主接口版本。
+1. 将项目放到自己的 GitHub 仓库默认分支，确保有 GitHub 托管的 Linux x86_64、Linux ARM64 和 macOS ARM64 runners。本地可先运行无外部副作用的只读预检：
+   `python3 scripts/release_gate.py preflight`（追加 `--online --repository <owner>/<repo>` 可只读查询上游最新正式版、兼容表与草稿冲突）。
+2. 保持仓库变量 `CPR_ENABLE_PUBLISH` 未设置时，定时触发会自动跳过，避免开发预览阶段反复冷构建三平台；维护者可手动触发 **Verify new CPR stable releases**（可指定 `host_tag`，如 `v3.54.5`；开启发布后也可勾选 `dry_run=true` 只演练验证与构建而不写入远端）。如需把三平台真机 smoke 通过的开发预览包挂到 GitHub Pre-release 便于测试服务器下载，可在手动触发时勾选 `prerelease=true`：工作流会按 `X.Y.Z-dev.N`（如 `v0.1.0-dev.1`）三平台构建并在 Linux 记录二进制最大 `GLIBC_*` 依赖，核对远端附件摘要后以 `--prerelease --latest=false` 发布，不占用正式版本号且不写 `cpr-compatibility` 兼容表。首次没有旧包时会直接跳过 `old` 三平台矩阵，进入三平台重建。
+3. 查看 `host-plan`、三平台输出、`release-decision` 与失败日志。脚本先校验 `plugin.json` 与 `Cargo.toml` 版本一致、锁定正式 tag 和 commit，再核对宿主二进制中的发布声明与源代码清单。若契约存在问题直接阻断并跳过昂贵的合同编译与旧包矩阵；旧包若覆盖目标版本并全部通过则复用；仅 `engines` 不覆盖、SDK 未变则重建清单；有兼容 SDK 变化则重编并再验。协议、必需能力、验收或摘要失败均禁止发布。兼容区间的下限是实际验证的宿主，不跨次版本声明支持。
+4. 完成授权模型验证并提交证据后，维护者再设置仓库变量 `CPR_ENABLE_PUBLISH=true`（若缺少有效档位证据，`decide` 会在启动三平台重建前提前阻断）。仅默认分支的 `publish` 任务在非 `dry_run` 时具备 `contents: write`。它使用未使用过的插件补丁版本，先以草稿上传三个包、`checksums.txt` 和 `verification.json`，核对远端全部 5 份附件的大小与 SHA-256（无 API 摘要时下载回算）通过后才转为正式版并核对 tag 提交，最后写兼容表并产出 `publish-receipt` artifact；不覆盖任何已发布文件，遇到残留草稿直接拒绝并提示人工核查。`cpr-compatibility` 分支中的 `compatibility/vX.Y.Z.json` 是该宿主 tag 的验证记录，包含宿主 commit、插件版本、平台和 SHA-256。
+5. 若上传、转正式或写兼容表阶段发生瞬时失败，可在同一默认分支提交上手动触发 **Verify new CPR stable releases** 并填入 `resume_run_id` 续跑：`resume-verify` 会先校验原 run 的工作流路径、默认分支、`head_sha` 和上游成功任务，复核全部候选包摘要后再交由 `publish` 执行（支持搭配 `dry_run=true` 只做只读复核）。若同提交、同摘要的正式 Release 已存在而仅缺兼容表，`publish` 会幂等复用已发布 Release 补写兼容表，无需重新编译三平台。
+6. **Early warning against CPR main** 只做合同比较、编译和测试。遇到接口变更，修 `src/host.rs` 或 `src/service.rs` 的宿主接入，确认私有状态兼容；不需要修改探针或指纹策略来追宿主接口版本。
 
 ## 4. 生产切换
 

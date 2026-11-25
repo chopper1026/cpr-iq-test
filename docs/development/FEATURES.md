@@ -10,7 +10,7 @@
 | CPR-04 | 已校准档位的正式结论及必要时复测 | 逻辑已实现，正式开放被阻断 | [档位定义](../../data/profiles.json)、[判定策略](../../src/domain.rs)、[校准流程](../release.md) | `gpt-6-sol / low` 目前只开放校准排名。缺证据会阻断正式判定和生产发布；授权健康 OAuth 账号的正例及差值阈值仍待验证。取消、限流和截断不会判为疑似。 |
 | CPR-05 | 手动和计划共享队列、额度、停用和到期去重 | 逻辑已实现，定时入口受档位限制 | [队列与预算](../../src/domain.rs)、[维护回调](../../src/service.rs) | 模拟时钟覆盖去重、不补跑、预算耗尽、停用和重启，未对真实 OAuth 账号开启定时巡检。 |
 | CPR-06 | 设置及历史摘要跨插件切换与进程重启保留 | 已实现 | [编解码](../../src/state_codec.rs)、[隔离验收](../../scripts/smoke_host.py) | 同一 `v3.54.5` 实例从 `0.0.0` 测试包切至 `0.1.0-dev.1` 并重启，设置和合成历史均保留。跨宿主版本回滚、生产恢复未验收。 |
-| CPR-07 | 检查宿主正式版，复用旧包或重建；`main` 只预警 | 代码已实现，远端工作流待验收 | [正式版工作流](../../.github/workflows/follow-host.yml)、[main 工作流](../../.github/workflows/host-main.yml)、[发版闸门测试](../../tests/test_release.py) | 本地覆盖旧包复用、需要重建、验证失败阻断；工作流静态检查通过。未执行远端 GitHub Actions 发包、兼容表写入或 main 定时任务。 |
+| CPR-07 | 检查宿主正式版，复用旧包或重建；支持预检、预发布预览、远端摘要核验与断点续跑；`main` 只预警 | 代码已实现，远端工作流待验收 | [正式版工作流](../../.github/workflows/follow-host.yml)、[main 工作流](../../.github/workflows/host-main.yml)、[发版闸门测试](../../tests/test_release.py) | 离线单测覆盖旧包复用、重建、无证据/契约失败前置短路、`vX.Y.Z-dev.N` 预发布（不写兼容表）、草稿远端摘要不符阻断转正、残留草稿拦截、已发布同源幂等续写兼容表、断点 run 来源校验与只读预检；工作流 `actionlint` 通过。远端 GitHub Actions 实跑、缓存命中、Linux glibc 实测与真实发布待本次执行验证。 |
 | CPR-08 | 生成安装包和摘要，三平台同源验证后发布 | 部分验证（本地 macOS ARM64） | [打包脚本](../../scripts/package.py)、[发布条件](../release.md) | 本地 macOS ARM64 开发包校验与安装通过。Linux x86_64、Linux ARM64 及实际三平台发布仍待验证；没有正式包或生产切换。 |
 
 ## 核验范围

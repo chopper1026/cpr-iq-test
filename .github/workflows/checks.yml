@@ -18,6 +18,24 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Restore locked detector data cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            data/unified_bank.json
+            data/shared_detector.bin
+          key: detector-assets-${{ hashFiles('data/detector.lock.json') }}
+      - name: Restore Cargo build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-checks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            cargo-checks-${{ runner.os }}-${{ runner.arch }}-
       - name: Verify locked reference data
         run: python scripts/detector_assets.py
       - name: Run tests and lints

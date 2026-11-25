@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: read
+concurrency:
+  group: cpr-host-main
+  cancel-in-progress: true
 
 jobs:
   preflight:
@@ -19,6 +22,24 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Restore locked detector data cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            data/unified_bank.json
+            data/shared_detector.bin
+          key: detector-assets-${{ hashFiles('data/detector.lock.json') }}
+      - name: Restore Cargo build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/plugin
+          key: cargo-host-main-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-host-main-${{ runner.os }}-${{ runner.arch }}-
       - name: Resolve main to a commit, compare APIs and compile only
         env:
           GH_TOKEN: ${{ github.token }}

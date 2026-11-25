@@ -17,5 +17,6 @@
 
 ## 变更与历程
 
+- [docs/development/changes/20261125-harden-release-workflow.md](changes/20261125-harden-release-workflow.md)
 - [docs/development/changes/20261125-initial-public-source.md](changes/20261125-initial-public-source.md)
 - [docs/development/changes/20261125-tidy-onboarding.md](changes/20261125-tidy-onboarding.md)

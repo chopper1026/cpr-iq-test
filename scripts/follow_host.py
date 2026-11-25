@@ -4,6 +4,7 @@
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -28,6 +29,7 @@ RUNTIME = SDK.parent / "runtime"
 RELEASE_MANIFEST = pathlib.Path("plugins/official/plugin-release-manifest.json")
 HOST_PLATFORM = dict(zip(TRIPLES, ("linux_amd64", "linux_arm64", "darwin_arm64"), strict=True))
 STABLE = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\Z")
+PRERELEASE = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-dev\.([1-9]\d*)\Z")
 SHA = re.compile(r"[a-f0-9]{40}\Z")
 DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 CALLBACKS = {
@@ -62,7 +64,7 @@ def api(path, missing=False):
             if e.code < 500 and e.code != 429:
                 raise
             error = e
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, http.client.HTTPException) as e:
             error = e
         time.sleep(1 + attempt * 2)
     raise RuntimeError(f"GitHub API read failed: {path}: {error}")
@@ -79,21 +81,35 @@ def ref_commit(repo, kind, name):
     raise ValueError(f"Ref is not a commit: {repo}/{kind}/{name}")
 
 
-def download(url, output, expected=None, size_limit=140 * 1024 * 1024):
-    if not url.startswith(("https://github.com/", "https://codeload.github.com/")):
+class _CrossHostAuthStripper(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and urllib.parse.urlparse(newurl).netloc != urllib.parse.urlparse(req.full_url).netloc:
+            redirected.headers.pop("Authorization", None)
+            redirected.unredirected_hdrs.pop("Authorization", None)
+        return redirected
+
+
+def download(url, output, expected=None, size_limit=140 * 1024 * 1024, headers=None, allow_api=False):
+    allowed = ("https://github.com/", "https://codeload.github.com/")
+    if allow_api:
+        allowed = (*allowed, "https://api.github.com/")
+    if not url.startswith(allowed):
         raise ValueError(f"Unexpected download location: {url}")
     if expected is not None and not DIGEST.fullmatch(expected):
         raise ValueError("Unusable SHA-256 for artifact")
     if output.is_file() and expected and file_sha(output) == expected:
         return output
     output.parent.mkdir(parents=True, exist_ok=True)
+    req_headers = {"User-Agent": "cpr-iq-test-ci", **(headers or {})}
+    opener = urllib.request.build_opener(_CrossHostAuthStripper())
     failure = None
     for attempt in range(3):
         try:
             with tempfile.NamedTemporaryFile(dir=output.parent, delete=False) as handle:
                 temporary = pathlib.Path(handle.name)
                 try:
-                    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent":"cpr-iq-test-ci"}), timeout=60) as response:
+                    with opener.open(urllib.request.Request(url, headers=req_headers), timeout=60) as response:
                         remaining = size_limit
                         while buf := response.read(1024 * 1024):
                             remaining -= len(buf)
@@ -107,10 +123,18 @@ def download(url, output, expected=None, size_limit=140 * 1024 * 1024):
                     return output
                 finally:
                     temporary.unlink(missing_ok=True)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, http.client.HTTPException) as error:
             failure = error
             time.sleep(1 + attempt * 2)
     raise RuntimeError(f"Download failed: {url}: {failure}")
+
+
+def download_release_asset(asset, output, expected=None, size_limit=140 * 1024 * 1024):
+    headers = {"Accept": "application/octet-stream"}
+    if token := os.environ.get("GH_TOKEN"):
+        headers["Authorization"] = "Bearer " + token
+    url = asset.get("url") or asset.get("browser_download_url", "")
+    return download(url, output, expected=expected, size_limit=size_limit, headers=headers, allow_api=True)
 
 
 def archive_unpack(archive, dest):
@@ -265,7 +289,12 @@ def discovery(args):
     repo = args.repository
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise ValueError("A valid plugin GitHub repository is required")
+    author = read_json(ROOT / "plugin.json")
+    cargo = tomllib.loads((ROOT / "Cargo.toml").read_text())
+    if cargo["package"]["version"] != author["version"]:
+        raise ValueError(f"Version mismatch: plugin.json ({author['version']}) != Cargo.toml ({cargo['package']['version']})")
     manual = bool(args.tag)
+    prerelease = bool(getattr(args, "prerelease", False))
     if manual and not STABLE.fullmatch(args.tag):
         raise ValueError("Use a stable upstream tag vX.Y.Z")
     release = api(f"repos/{UPSTREAM}/releases/" + ("tags/" + args.tag if manual else "latest"))
@@ -277,39 +306,64 @@ def discovery(args):
     if known and known["hostCommit"] != sha:
         raise ValueError("Published upstream tag moved: stop rather than overwriting compatibility evidence")
     result = {"hostTag": tag, "hostCommit": sha, "hostAssets": slim_assets(release["assets"]), "repository": repo,
-              "skip": bool(known and not manual)}
+              "prerelease": prerelease, "skip": bool(known and not manual and not prerelease)}
+    contract_ok = False
+    has_previous = False
     if not result["skip"]:
         records = []
-        series = read_json(ROOT / "plugin.json")["version"].rsplit(".",1)[0]
+        dev_numbers = []
+        drafts = []
+        author_version = author["version"]
+        series = author_version.rsplit(".", 1)[0]
         for prior in own_releases(repo):
             prior_tag = prior["tag_name"]
             if STABLE.fullmatch(prior_tag) and prior_tag.startswith(f"v{series}."):
-                records.append((int(prior_tag.rsplit(".",1)[1]), prior))
-        available = [item for _, item in sorted(records, key=lambda p:p[0], reverse=True) if not item["draft"] and not item["prerelease"]
+                records.append((int(prior_tag.rsplit(".", 1)[1]), prior))
+                if prior.get("draft"):
+                    drafts.append({"tag": prior_tag, "id": prior.get("id")})
+            elif (dev_match := PRERELEASE.fullmatch(prior_tag)) and prior_tag.startswith(f"v{author_version}-dev."):
+                dev_numbers.append(int(dev_match[4]))
+                if prior.get("draft"):
+                    drafts.append({"tag": prior_tag, "id": prior.get("id")})
+        available = [item for _, item in sorted(records, key=lambda p: p[0], reverse=True) if not item["draft"] and not item["prerelease"]
                      and "verification.json" in slim_assets(item["assets"])]
-        if known:
+        if known and not prerelease:
             known_tag = "v" + known["pluginVersion"]
             available = [rel for rel in available if rel["tag_name"] == known_tag]
             if not available:
                 raise ValueError("Recorded verified plugin release is missing; do not silently rewrite the compatibility table")
         tool_source = host_source(sha, args.work)
-        base_pin = tomllib.loads((ROOT / "Cargo.toml").read_text())["dependencies"]["gateway-plugin-sdk"]["rev"]
+        base_pin = cargo["dependencies"]["gateway-plugin-sdk"]["rev"]
         base = host_source(base_pin, args.work)
         result["contract"] = contract(tool_source, base)
         result["rust"] = rust_channel(tool_source)
-        result["previous"] = None if not available else {
+        result["previous"] = None if (prerelease or not available) else {
             "version": available[0]["tag_name"][1:], "assets": slim_assets(available[0]["assets"]),
         }
-        result["candidateVersion"] = series + "." + str(1 + max((patch for patch, _ in records), default=-1))
-        result["minimumHost"] = read_json(ROOT / "plugin.json")["engines"]["codex-proxy-rs"].removeprefix("~")
+        result["draftReleases"] = drafts
+        if prerelease:
+            result["candidateVersion"] = f"{author_version}-dev.{1 + max(dev_numbers, default=0)}"
+        else:
+            result["candidateVersion"] = series + "." + str(1 + max((patch for patch, _ in records), default=-1))
+        result["minimumHost"] = author["engines"]["codex-proxy-rs"].removeprefix("~")
         # A target older than the original validated SDK baseline should require a deliberate port.
         minimum = tuple(map(int, result["minimumHost"].split(".")))
         if tuple(map(int, STABLE.fullmatch(tag).groups())) < minimum:
             raise ValueError("Host target is below the supported baseline")
+        contract_ok = not result["contract"]["problems"]
+        has_previous = result["previous"] is not None
     write_json(args.output, result)
     if args.github_output:
         with args.github_output.open("a") as f:
-            print(f"skip={str(result['skip']).lower()}\nhost_tag={tag}\nhost_sha={sha}", file=f)
+            print(
+                f"skip={str(result['skip']).lower()}\n"
+                f"host_tag={tag}\n"
+                f"host_sha={sha}\n"
+                f"prerelease={str(prerelease).lower()}\n"
+                f"contract_ok={str(contract_ok).lower()}\n"
+                f"has_previous={str(has_previous).lower()}",
+                file=f,
+            )
             if "rust" in result:
                 print(f"rust={result['rust']}", file=f)
     print(f"Host {tag} at {sha}: " + ("already verified" if result["skip"] else json.dumps(result["contract"], ensure_ascii=False)))
@@ -337,6 +391,7 @@ def main():
     discover = sub.add_parser("discover")
     discover.add_argument("--repository", required=True)
     discover.add_argument("--tag", default="")
+    discover.add_argument("--prerelease", action="store_true")
     discover.add_argument("--github-output", type=pathlib.Path)
     nightly = sub.add_parser("main")
     nightly.add_argument("--compile", action="store_true")
