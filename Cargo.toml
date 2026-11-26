@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 base64 = "0.22"
 flate2 = "1"
-gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "45a4d580c7e1ac2b2c0308d72ae5018148f2516a", features = ["io"] }
+gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "add1f9f40f79781823475b4ed0f459d3b8c9cb9f", features = ["io"] }
 lmfpd = { git = "https://github.com/Ikaleio/lm-detector.git", rev = "e0472890bea827d15ca883636a77d4c10bbe843b" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

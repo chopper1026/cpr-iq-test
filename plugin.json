@@ -6,12 +6,18 @@
   "version": "0.1.0",
   "description": "指定账号的模型参考指纹检测与定时巡检，支持可选的指纹异常自动停用与备注记录。",
   "license": "Apache-2.0",
-  "engines": { "codex-proxy-rs": "~3.54.5" },
+  "engines": {
+    "codex-proxy-rs": "~3.55.2"
+  },
   "main": "bin/plugin",
   "runtime": "trustedProcess",
   "contributes": {
-    "management": { "version": 2 },
-    "maintenance": { "version": 1 }
+    "management": {
+      "version": 2
+    },
+    "maintenance": {
+      "version": 1
+    }
   },
   "resources": {
     "web/index.html": "text/html",
@@ -27,7 +33,19 @@
     {
       "namespace": "iq-test",
       "schemaVersion": 1,
-      "schema": { "type": "object", "additionalProperties": false, "required": ["document"], "properties": { "document": { "type": "string", "maxLength": 59392 } } },
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "document"
+        ],
+        "properties": {
+          "document": {
+            "type": "string",
+            "maxLength": 59392
+          }
+        }
+      },
       "maximumRecords": 1,
       "maximumBytes": 65536,
       "maximumValueBytes": 61440
