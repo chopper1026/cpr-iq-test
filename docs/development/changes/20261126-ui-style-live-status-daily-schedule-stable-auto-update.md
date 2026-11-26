@@ -27,6 +27,7 @@
 
 ### 问题修复
 - 修复 `src/fingerprint.rs` 测试在复用 `CARGO_TARGET_DIR`（如二次本地打包或 CI 命中 Cargo 缓存）时 `env!("CARGO_MANIFEST_DIR")` 指向已销毁临时目录的问题，改为优先按当前工作目录读取 `data/`。
+- 修复 `scripts/sync_upstreams.py` 在 CI 通过 `rustup toolchain install --profile minimal` 安装目标 Rust 工具链时缺少 `clippy` 组件导致同步校验失败的问题，显式追加 `--component clippy`。
 
 ### 架构与功能影响
 - 更新 `README.md`、`docs/release.md`、`docs/development/ARCHITECTURE.md`、`docs/development/PERSISTENCE.md`、`docs/development/FEATURES.md`、`docs/development/HANDOFF.md` 与 `.tidy.json`。

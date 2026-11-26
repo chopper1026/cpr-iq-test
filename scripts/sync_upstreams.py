@@ -258,7 +258,10 @@ def apply_sync(report, *, verify=True):
     rust_ver = report["host"]["targetRust"] if report["host"]["rustChanged"] else report["host"]["currentRust"]
     cargo_cmd = ["cargo"]
     if os.environ.get("GITHUB_ACTIONS") == "true" or report["host"]["rustChanged"]:
-        subprocess.run(["rustup", "toolchain", "install", rust_ver, "--profile", "minimal"], check=True)
+        subprocess.run(
+            ["rustup", "toolchain", "install", rust_ver, "--profile", "minimal", "--component", "clippy"],
+            check=True,
+        )
         cargo_cmd = ["cargo", f"+{rust_ver}"]
 
     updated_crates = []
