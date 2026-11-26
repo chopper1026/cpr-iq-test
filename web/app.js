@@ -575,6 +575,9 @@
   let logTargetRunId = null;
   let scheduleMode = 'interval';
   let dailySlotRows = [];
+  let scheduleBaseline = null;
+  let scheduleFeedback = null;
+  let scheduleEpoch = 0;
   const canDownloadFile = window.origin !== 'null';
 
   const statusFilter = {
@@ -647,13 +650,17 @@
   }
 
   /* ---------------- Reusable Target Controls (Manual & Schedule) ---------------- */
-  function createTargetControls(containerId) {
+  function createTargetControls(containerId, onChange = null) {
     const selectedIds = new Set();
+    const notifyChange = () => {
+      if (typeof onChange === 'function') onChange();
+      updateButtons();
+    };
 
     const keySelect = createZSelect({
       placeholder: '选择已启用 Client Key',
       ariaLabel: '测试 Client Key',
-      onChange: () => updateButtons(),
+      onChange: notifyChange,
     });
     const modelSelect = createZSelect({
       placeholder: '选择模型',
@@ -663,13 +670,13 @@
       minMenuWidth: 260,
       onChange: () => {
         syncEfforts(ctrl);
-        updateButtons();
+        notifyChange();
       },
     });
     const effortSelect = createZSelect({
       placeholder: '请先选择模型',
       ariaLabel: '推理档位',
-      onChange: () => updateButtons(),
+      onChange: notifyChange,
     });
 
     const keyGroup = make('div', null, 'field-group');
@@ -721,6 +728,7 @@
       selectAttentionBtn,
       clearBtn,
       selectedIds,
+      notifyChange,
     };
 
     search.addEventListener('input', () => renderAccountList(ctrl));
@@ -731,7 +739,7 @@
         selectedIds.add(a.id);
       }
       renderAccountList(ctrl);
-      updateButtons();
+      notifyChange();
     });
     selectAttentionBtn.addEventListener('click', () => {
       const visible = filteredAccounts(search.value);
@@ -744,19 +752,23 @@
         }
       }
       renderAccountList(ctrl);
-      updateButtons();
+      notifyChange();
     });
     clearBtn.addEventListener('click', () => {
       selectedIds.clear();
       renderAccountList(ctrl);
-      updateButtons();
+      notifyChange();
     });
 
     return ctrl;
   }
 
+  function clearScheduleFeedback() {
+    scheduleFeedback = null;
+  }
+
   const manual = createTargetControls('manual-target');
-  const planned = createTargetControls('schedule-target');
+  const planned = createTargetControls('schedule-target', clearScheduleFeedback);
 
   /* ---------------- Schedule Controls (Interval + Daily Fixed Time) ---------------- */
   const scheduleHoursSelect = createZSelect({
@@ -770,7 +782,10 @@
       { value: '48', label: '每 48 小时' },
       { value: '168', label: '每 7 天' },
     ],
-    onChange: () => updateButtons(),
+    onChange: () => {
+      clearScheduleFeedback();
+      updateButtons();
+    },
   });
   $('schedule-hours-host').append(scheduleHoursSelect.el);
 
@@ -780,11 +795,14 @@
     searchPlaceholder: '搜索时区或城市…',
     value: String(browserOffsetMinutes),
     options: buildTimezoneOptions(browserOffsetMinutes),
-    onChange: () => updateButtons(),
+    onChange: () => {
+      clearScheduleFeedback();
+      updateButtons();
+    },
   });
   $('schedule-tz-host').append(scheduleTzSelect.el);
 
-  function setScheduleMode(mode) {
+  function setScheduleMode(mode, silent = false) {
     scheduleMode = mode === 'daily' ? 'daily' : 'interval';
     for (const btn of $('schedule-mode-group').querySelectorAll('.z-seg-item')) {
       const active = btn.dataset.mode === scheduleMode;
@@ -793,12 +811,13 @@
     }
     $('schedule-interval-panel').hidden = scheduleMode !== 'interval';
     $('schedule-daily-panel').hidden = scheduleMode !== 'daily';
-    updateButtons();
+    if (!silent) updateButtons();
   }
 
   $('schedule-mode-group').addEventListener('click', e => {
     const btn = e.target.closest('.z-seg-item');
     if (!btn) return;
+    clearScheduleFeedback();
     setScheduleMode(btn.dataset.mode);
   });
 
@@ -824,7 +843,10 @@
         ariaLabel: '小时',
         value: hh.padStart(2, '0'),
         options: HOUR_OPTIONS,
-        onChange: () => updateButtons(),
+        onChange: () => {
+          clearScheduleFeedback();
+          updateButtons();
+        },
       });
       hourWrap.append(hourSelect.el);
 
@@ -834,7 +856,10 @@
         ariaLabel: '分钟',
         value: mm.padStart(2, '0'),
         options: MINUTE_OPTIONS,
-        onChange: () => updateButtons(),
+        onChange: () => {
+          clearScheduleFeedback();
+          updateButtons();
+        },
       });
       minWrap.append(minuteSelect.el);
 
@@ -849,6 +874,7 @@
         rmBtn.addEventListener('click', () => {
           const remaining = readDailyTimes().filter((_, i) => i !== dailySlotRows.indexOf(entry));
           renderDailySlots(remaining.length ? remaining : ['09:00']);
+          clearScheduleFeedback();
           updateButtons();
         });
         rowEl.append(rmBtn);
@@ -885,6 +911,7 @@
       }
     }
     renderDailySlots([...current, candidate || '09:30']);
+    clearScheduleFeedback();
     updateButtons();
   });
 
@@ -1061,7 +1088,7 @@
           if (check.checked) ctrl.selectedIds.add(a.id);
           else ctrl.selectedIds.delete(a.id);
           renderAccountList(ctrl);
-          updateButtons();
+          ctrl.notifyChange();
         });
 
         const box = make('span', null, 'z-checkbox-box');
@@ -1204,10 +1231,219 @@
     return h === 168 ? '每 7 天' : `每 ${h} 小时`;
   }
 
+  function readScheduleFormSnapshot() {
+    const t = readTarget(planned);
+    return {
+      enabled: $('enabled').checked,
+      mode: scheduleMode,
+      hours: Number(scheduleHoursSelect.getValue()) || 24,
+      dailyTimes: [...readDailyTimes()].sort(),
+      utcOffsetMinutes: Number(scheduleTzSelect.getValue()) || 0,
+      target: {
+        clientKeyId: t.clientKeyId,
+        model: t.model,
+        effort: t.effort,
+        accountIds: [...t.accountIds],
+      },
+    };
+  }
+
+  function isScheduleDirty() {
+    if (!schedule || !scheduleBaseline) return false;
+    const cur = readScheduleFormSnapshot();
+    if (cur.enabled !== scheduleBaseline.enabled) return true;
+    if (cur.mode !== scheduleBaseline.mode) return true;
+    if (cur.mode === 'interval' && cur.hours !== scheduleBaseline.hours) return true;
+    if (cur.mode === 'daily') {
+      if (cur.utcOffsetMinutes !== scheduleBaseline.utcOffsetMinutes) return true;
+      if (cur.dailyTimes.join(',') !== scheduleBaseline.dailyTimes.join(',')) return true;
+    }
+    const bt = scheduleBaseline.target;
+    return (
+      cur.target.clientKeyId !== bt.clientKeyId ||
+      cur.target.model !== bt.model ||
+      cur.target.effort !== bt.effort ||
+      cur.target.accountIds.join(',') !== bt.accountIds.join(',')
+    );
+  }
+
+  function validateScheduleForm(targetEnabled = $('enabled').checked) {
+    const s = readTarget(planned);
+    const dailyTimes = readDailyTimes();
+    if (scheduleMode === 'daily' && hasDuplicateDailyTimes(dailyTimes)) {
+      return {
+        code: 'dupTimes',
+        message: '存在重复的每日执行时间点，请修改后再保存。',
+        focusEl: $('daily-slots'),
+      };
+    }
+    if (!targetEnabled) return null;
+    if (!catalog.detectorReady) {
+      return {
+        code: 'detectorUnavailable',
+        message: '本地参考指纹库未就绪，暂时无法开启定时巡检。',
+        focusEl: $('accessible-status'),
+      };
+    }
+    if (!s.clientKeyId) {
+      return {
+        code: 'missingKey',
+        message: catalog.keys.length
+          ? '请先在下方选择「测试 Client Key」，再保存并开启定时巡检。'
+          : '当前没有已启用的 Client Key，请先在宿主中创建并启用 Client Key。',
+        focusEl: planned.key.el,
+      };
+    }
+    if (!s.model || !s.effort) {
+      return {
+        code: 'missingModel',
+        message: catalog.models.length
+          ? '请先在下方选择「检测模型」与「推理档位」，再保存并开启定时巡检。'
+          : '暂未获取到可用模型目录，请点击右上角「刷新目录」后重试。',
+        focusEl: planned.model.el,
+      };
+    }
+    if (s.accountIds.length === 0) {
+      return {
+        code: 'missingAccounts',
+        message: catalog.accounts.length
+          ? '请先在下方勾选至少 1 个「指定账号」，再点击「保存并开启」生效。'
+          : '当前暂无启用的 OpenAI OAuth 账号，暂时无法开启定时巡检。',
+        focusEl: planned.accounts.closest('fieldset'),
+      };
+    }
+    if (s.accountIds.length > catalog.maxBatch) {
+      return {
+        code: 'tooManyAccounts',
+        message: `单次巡检最多选择 ${catalog.maxBatch} 个账号，请减少所选账号后再保存。`,
+        focusEl: planned.accounts.closest('fieldset'),
+      };
+    }
+    return null;
+  }
+
+  function highlightScheduleTarget(el) {
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.remove('is-attention-highlight');
+    void el.offsetWidth;
+    el.classList.add('is-attention-highlight');
+    setTimeout(() => el.classList.remove('is-attention-highlight'), 1800);
+  }
+
+  function renderScheduleState() {
+    const badge = $('schedule-badge');
+    const banner = $('schedule-state-banner');
+    const textEl = $('schedule-state-text');
+    const locateBtn = $('schedule-banner-locate');
+    const actionBtn = $('schedule-banner-action');
+
+    if (!schedule) {
+      badge.textContent = '加载中';
+      badge.className = 'z-tag z-tag-xs';
+      banner.hidden = true;
+      return;
+    }
+
+    const persistedEnabled = Boolean(schedule.settings?.enabled);
+    const draftEnabled = $('enabled').checked;
+    const dirty = isScheduleDirty();
+    const issue = validateScheduleForm(draftEnabled);
+
+    if (persistedEnabled && !dirty) {
+      badge.textContent = '已开启';
+      badge.className = 'z-tag z-tag-xs z-tag-success';
+    } else if (persistedEnabled && dirty) {
+      badge.textContent = '已开启 · 有未保存修改';
+      badge.className = 'z-tag z-tag-xs z-tag-warning';
+    } else if (!persistedEnabled && draftEnabled) {
+      badge.textContent = '未生效 · 待保存';
+      badge.className = 'z-tag z-tag-xs z-tag-warning';
+    } else if (!persistedEnabled && dirty) {
+      badge.textContent = '已关闭 · 有未保存修改';
+      badge.className = 'z-tag z-tag-xs z-tag-warning';
+    } else {
+      badge.textContent = '已关闭';
+      badge.className = 'z-tag z-tag-xs';
+    }
+
+    locateBtn.hidden = true;
+    actionBtn.hidden = true;
+    actionBtn.disabled = busy;
+    delete actionBtn.dataset.action;
+
+    if (scheduleFeedback?.kind === 'error') {
+      banner.hidden = false;
+      banner.className = 'schedule-banner is-error';
+      textEl.textContent = scheduleFeedback.text;
+      if (issue?.focusEl) {
+        locateBtn.hidden = false;
+        locateBtn.textContent = issue.code === 'missingAccounts' ? '去选账号 ↓' : '去修改 ↓';
+      }
+      return;
+    }
+
+    if (draftEnabled && !persistedEnabled) {
+      banner.hidden = false;
+      banner.className = 'schedule-banner';
+      if (issue) {
+        textEl.textContent = `定时巡检尚未生效：${issue.message}`;
+        if (issue.focusEl) {
+          locateBtn.hidden = false;
+          locateBtn.textContent = issue.code === 'missingAccounts' ? '去选账号 ↓' : '去补全设置 ↓';
+        }
+        if (
+          issue.code === 'missingAccounts' &&
+          catalog.accounts.length > 0 &&
+          catalog.accounts.length <= catalog.maxBatch
+        ) {
+          actionBtn.hidden = false;
+          actionBtn.textContent = `全选 ${catalog.accounts.length} 个账号并开启`;
+          actionBtn.dataset.action = 'select-all-and-enable';
+        }
+      } else {
+        textEl.textContent = '定时巡检尚未生效：配置已就绪，点击「保存并开启」立即生效。';
+        actionBtn.hidden = false;
+        actionBtn.textContent = '保存并开启';
+        actionBtn.dataset.action = 'save';
+      }
+      return;
+    }
+
+    if (dirty) {
+      banner.hidden = false;
+      if (issue) {
+        banner.className = 'schedule-banner';
+        textEl.textContent = `有未保存修改：${issue.message}`;
+        if (issue.focusEl) {
+          locateBtn.hidden = false;
+          locateBtn.textContent = issue.code === 'missingAccounts' ? '去选账号 ↓' : '去修改 ↓';
+        }
+      } else {
+        banner.className = 'schedule-banner is-info';
+        textEl.textContent = '巡检配置已修改但尚未保存，点击「立即保存」生效（未保存修改在离开页面后会丢失）。';
+        actionBtn.hidden = false;
+        actionBtn.textContent = '立即保存';
+        actionBtn.dataset.action = 'save';
+      }
+      return;
+    }
+
+    if (scheduleFeedback?.kind === 'success') {
+      banner.hidden = false;
+      banner.className = 'schedule-banner is-success';
+      textEl.textContent = scheduleFeedback.text;
+      return;
+    }
+
+    banner.hidden = true;
+  }
+
   function updateButtons() {
     const m = readTarget(manual);
     const s = readTarget(planned);
     const enabled = $('enabled').checked;
+    const persistedEnabled = Boolean(schedule?.settings?.enabled);
     const dailyTimes = readDailyTimes();
     const dupTimes = scheduleMode === 'daily' && hasDuplicateDailyTimes(dailyTimes);
 
@@ -1227,8 +1463,11 @@
     }
 
     $('submit-run').disabled = busy || !catalog.detectorReady || !isTargetUsable(m);
-    $('save').disabled = busy || !schedule || dupTimes || (enabled && (!catalog.detectorReady || !isTargetUsable(s)));
+    $('enabled').disabled = busy || !schedule;
+    $('save').disabled = busy || !schedule;
+    $('save').textContent = enabled && !persistedEnabled ? '保存并开启定时巡检' : '保存巡检设置';
     $('auto-disable-on-suspect').disabled = busy || !schedule;
+    renderScheduleState();
   }
 
   function renderPolicyBadge(enabled) {
@@ -1248,8 +1487,10 @@
     scheduleTzSelect.setOptions(buildTimezoneOptions(offset), true);
     scheduleTzSelect.setValue(String(offset));
     renderDailySlots(cfg.dailyTimes && cfg.dailyTimes.length ? cfg.dailyTimes : ['09:00']);
-    setScheduleMode(cfg.mode === 'daily' ? 'daily' : 'interval');
+    setScheduleMode(cfg.mode === 'daily' ? 'daily' : 'interval', true);
     applyTarget(planned, cfg.target || { clientKeyId: '', model: '', effort: '', accountIds: [] });
+    scheduleBaseline = readScheduleFormSnapshot();
+    $('schedule-notice').className = 'notice';
     $('schedule-notice').textContent = data.lastSkip ? `上次巡检跳过原因：${reasonText(data.lastSkip)}` : '';
     renderSummary();
     updateButtons();
@@ -1890,6 +2131,7 @@
       if (forceModelRefresh) catQuery.refresh = '1';
       if (manual.key.getValue()) catQuery.clientKeyId = manual.key.getValue();
 
+      const epochBefore = scheduleEpoch;
       const [nextCatalog, nextStatus, nextRuns, nextSchedule] = await Promise.all([
         full ? request('GET', 'catalog', null, catQuery) : catalog,
         request('GET', 'accounts/status'),
@@ -1907,6 +2149,7 @@
       ]);
 
       catalog = nextCatalog;
+      const scheduleFresh = epochBefore === scheduleEpoch;
       if (full) {
         const modelCount = catalog.models.length;
         const accountCount = catalog.accounts.length;
@@ -1922,9 +2165,17 @@
         }
         $('version').textContent = `插件 ${catalog.pluginVersion} · 参考库 ${catalog.detectorRevision || '未加载'}`;
         applyTarget(manual, readTarget(manual));
-        applySchedule(nextSchedule);
-      } else {
-        schedule = nextSchedule;
+        if (scheduleFresh) {
+          clearScheduleFeedback();
+          applySchedule(nextSchedule);
+        }
+      } else if (scheduleFresh) {
+        const remoteChanged = schedule && JSON.stringify(schedule.settings) !== JSON.stringify(nextSchedule.settings);
+        if (remoteChanged && !isScheduleDirty()) {
+          applySchedule(nextSchedule);
+        } else {
+          schedule = nextSchedule;
+        }
       }
       applyAccountStatuses(nextStatus);
       renderRuns(nextRuns);
@@ -1937,8 +2188,141 @@
     }
   }
 
-  /* ---------------- Event Bindings ---------------- */
-  $('enabled').addEventListener('change', updateButtons);
+  /* ---------------- Schedule Persistence & Event Bindings ---------------- */
+  async function persistScheduleSettings(settings, { syncForm = true, successMessage = '' } = {}) {
+    busy = true;
+    scheduleEpoch += 1;
+    updateButtons();
+    $('schedule-notice').className = 'notice';
+    $('schedule-notice').textContent = '正在保存巡检设置…';
+    try {
+      const updated = await request('PUT', 'schedule', { settings, previous: schedule.settings });
+      scheduleEpoch += 1;
+      if (syncForm) {
+        applySchedule(updated);
+      } else {
+        schedule = updated;
+        if (scheduleBaseline) {
+          scheduleBaseline.enabled = Boolean(updated.settings?.enabled);
+        }
+        $('enabled').checked = Boolean(updated.settings?.enabled);
+        renderSummary();
+      }
+      const msg = successMessage || (updated.settings?.enabled
+        ? `定时巡检已保存并启用（${describeScheduleShort(updated.settings)}，下次执行：${localDate(updated.nextDueAt)}）。`
+        : '定时巡检已保存（当前关闭）。');
+      scheduleFeedback = { kind: 'success', text: msg };
+      $('schedule-notice').className = 'notice is-success';
+      $('schedule-notice').textContent = msg;
+      await refresh(false);
+      return true;
+    } catch (error) {
+      const msg = `保存失败：${reasonText(error.message)}`;
+      scheduleFeedback = { kind: 'error', text: msg };
+      $('schedule-notice').className = 'notice is-error';
+      $('schedule-notice').textContent = msg;
+      return false;
+    } finally {
+      busy = false;
+      updateButtons();
+    }
+  }
+
+  async function saveScheduleFromForm() {
+    if (!schedule || busy) return false;
+    const enabled = $('enabled').checked;
+    const issue = validateScheduleForm(enabled);
+    if (issue) {
+      scheduleFeedback = { kind: 'error', text: issue.message };
+      $('schedule-notice').className = 'notice is-error';
+      $('schedule-notice').textContent = issue.message;
+      updateButtons();
+      highlightScheduleTarget(issue.focusEl);
+      return false;
+    }
+    const selected = readTarget(planned);
+    const dailyTimes = [...readDailyTimes()].sort();
+    const settings = {
+      enabled,
+      mode: scheduleMode,
+      hours: Number(scheduleHoursSelect.getValue()) || 24,
+      dailyTimes,
+      utcOffsetMinutes: Number(scheduleTzSelect.getValue()) || 0,
+      autoDisableOnSuspect: $('auto-disable-on-suspect').checked,
+      target: isTargetUsable(selected) ? selected : schedule.settings.target,
+    };
+    return persistScheduleSettings(settings, { syncForm: true });
+  }
+
+  $('enabled').addEventListener('change', async () => {
+    if (!schedule || busy) return;
+    clearScheduleFeedback();
+    const nextEnabled = $('enabled').checked;
+    const persistedEnabled = Boolean(schedule.settings?.enabled);
+
+    if (nextEnabled) {
+      const issue = validateScheduleForm(true);
+      if (!issue) {
+        const ok = await saveScheduleFromForm();
+        if (!ok) {
+          $('enabled').checked = persistedEnabled;
+          updateButtons();
+        }
+        return;
+      }
+      $('schedule-notice').className = 'notice';
+      $('schedule-notice').textContent = `定时巡检尚未生效：${issue.message}`;
+      updateButtons();
+      return;
+    }
+
+    if (persistedEnabled) {
+      const settings = {
+        ...schedule.settings,
+        enabled: false,
+        autoDisableOnSuspect: $('auto-disable-on-suspect').checked,
+      };
+      const ok = await persistScheduleSettings(settings, {
+        syncForm: false,
+        successMessage: '定时巡检已关闭（已保留原巡检配置，再次开启即可恢复）。',
+      });
+      if (!ok) {
+        $('enabled').checked = persistedEnabled;
+        updateButtons();
+      }
+      return;
+    }
+
+    $('schedule-notice').className = 'notice';
+    $('schedule-notice').textContent = '';
+    updateButtons();
+  });
+
+  $('schedule-banner-locate').addEventListener('click', () => {
+    const issue = validateScheduleForm($('enabled').checked);
+    if (issue?.focusEl) highlightScheduleTarget(issue.focusEl);
+  });
+
+  $('schedule-banner-action').addEventListener('click', async () => {
+    if (!schedule || busy) return;
+    const action = $('schedule-banner-action').dataset.action;
+    if (action === 'select-all-and-enable') {
+      planned.selectedIds.clear();
+      for (const a of catalog.accounts) {
+        if (planned.selectedIds.size >= catalog.maxBatch) break;
+        planned.selectedIds.add(a.id);
+      }
+      renderAccountList(planned);
+      clearScheduleFeedback();
+      updateButtons();
+      await saveScheduleFromForm();
+      return;
+    }
+    if (action === 'save') {
+      await saveScheduleFromForm();
+    }
+  });
+
   $('auto-disable-on-suspect').addEventListener('change', async () => {
     if (!schedule || busy) return;
     const nextValue = $('auto-disable-on-suspect').checked;
@@ -1952,11 +2336,13 @@
       autoDisableOnSuspect: nextValue,
     };
     busy = true;
+    scheduleEpoch += 1;
     renderPolicyBadge(nextValue);
     updateButtons();
     $('policy-notice').textContent = '正在保存自动停用设置…';
     try {
       const updated = await request('PUT', 'schedule', { settings, previous: prevSettings });
+      scheduleEpoch += 1;
       schedule = updated;
       const enabledGuard = Boolean(updated.settings?.autoDisableOnSuspect);
       $('auto-disable-on-suspect').checked = enabledGuard;
@@ -2041,31 +2427,7 @@
   $('schedule').addEventListener('submit', async e => {
     e.preventDefault();
     if ($('save').disabled) return;
-    const selected = readTarget(planned);
-    const dailyTimes = [...readDailyTimes()].sort();
-    const settings = {
-      enabled: $('enabled').checked,
-      mode: scheduleMode,
-      hours: Number(scheduleHoursSelect.getValue()) || 24,
-      dailyTimes,
-      utcOffsetMinutes: Number(scheduleTzSelect.getValue()) || 0,
-      autoDisableOnSuspect: $('auto-disable-on-suspect').checked,
-      target: isTargetUsable(selected) ? selected : schedule.settings.target,
-    };
-    busy = true;
-    updateButtons();
-    try {
-      applySchedule(await request('PUT', 'schedule', { settings, previous: schedule.settings }));
-      $('schedule-notice').textContent = settings.enabled
-        ? `定时巡检已保存并启用（${describeScheduleShort(settings)}）。`
-        : '定时巡检已保存（当前关闭）。';
-      await refresh(false);
-    } catch (error) {
-      $('schedule-notice').textContent = reasonText(error.message);
-    } finally {
-      busy = false;
-      updateButtons();
-    }
+    await saveScheduleFromForm();
   });
 
   $('cancel-pending').addEventListener('click', async () => {

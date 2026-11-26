@@ -28,5 +28,6 @@
 - [docs/development/changes/20261125-tidy-onboarding.md](changes/20261125-tidy-onboarding.md)
 - [docs/development/changes/20261125-tidy-rebuild-rev6.md](changes/20261125-tidy-rebuild-rev6.md)
 - [docs/development/changes/20261126-fix-account-identity-and-log-export.md](changes/20261126-fix-account-identity-and-log-export.md)
+- [docs/development/changes/20261126-fix-schedule-toggle-persistence.md](changes/20261126-fix-schedule-toggle-persistence.md)
 - [docs/development/changes/20261126-release-upload-retry.md](changes/20261126-release-upload-retry.md)
 - [docs/development/changes/20261126-ui-style-live-status-daily-schedule-stable-auto-update.md](changes/20261126-ui-style-live-status-daily-schedule-stable-auto-update.md)

@@ -150,7 +150,7 @@
           <div id="manual-target"></div>
           <p class="estimate" id="manual-cost">预计调用：—</p>
           <div class="form-actions">
-            <button class="z-btn z-btn-primary" type="submit" id="submit-run" disabled>开始检测</button>
+            <button class="z-btn z-btn-primary" type="submit" id="submit-run" formnovalidate disabled>开始检测</button>
             <button class="z-btn z-btn-link" type="button" id="goto-records" hidden>查看任务记录 →</button>
           </div>
           <p class="notice" id="manual-notice" role="status"></p>
@@ -160,20 +160,31 @@
       <section class="z-card" aria-labelledby="schedule-title">
         <div class="card-head">
           <div>
-            <h2 id="schedule-title">定时巡检</h2>
-            <p class="card-desc">默认关闭。支持按固定间隔或每日固定时间自动检测指定账号，错过时间槽不补跑积压任务。</p>
+            <div class="policy-head">
+              <h2 id="schedule-title">定时巡检</h2>
+              <span class="z-tag z-tag-xs" id="schedule-badge">已关闭</span>
+            </div>
+            <p class="card-desc">默认关闭。支持按固定间隔或每日固定时间自动检测指定账号，错过时间槽不补跑积压任务；已选定巡检目标时切换开关可即时生效。</p>
           </div>
         </div>
         <form id="schedule" novalidate>
           <div class="schedule-top">
             <label class="z-switch">
-              <input id="enabled" type="checkbox" role="switch">
+              <input id="enabled" type="checkbox" role="switch" disabled>
               <span class="z-switch-track" aria-hidden="true"><span class="z-switch-thumb"></span></span>
               <span class="z-switch-label">启用定时巡检</span>
             </label>
             <div class="z-segmented z-segmented-sm" id="schedule-mode-group" role="radiogroup" aria-label="巡检触发模式">
               <button type="button" class="z-seg-item is-active" data-mode="interval" role="radio" aria-checked="true">按间隔巡检</button>
               <button type="button" class="z-seg-item" data-mode="daily" role="radio" aria-checked="false">每日固定时间</button>
+            </div>
+          </div>
+
+          <div id="schedule-state-banner" class="schedule-banner" role="status" hidden>
+            <span id="schedule-state-text"></span>
+            <div class="schedule-banner-actions">
+              <button type="button" class="z-btn z-btn-xs z-btn-secondary" id="schedule-banner-locate" hidden>去补全设置 ↓</button>
+              <button type="button" class="z-btn z-btn-xs z-btn-primary" id="schedule-banner-action" hidden>立即保存</button>
             </div>
           </div>
 
@@ -199,7 +210,7 @@
           <div id="schedule-target"></div>
           <p class="estimate" id="schedule-cost">定时巡检已关闭，不会自动发起调用。</p>
           <div class="form-actions">
-            <button class="z-btn z-btn-primary" type="submit" id="save" disabled>保存巡检设置</button>
+            <button class="z-btn z-btn-primary" type="submit" id="save" formnovalidate disabled>保存巡检设置</button>
           </div>
           <p class="notice" id="schedule-notice" role="status"></p>
         </form>

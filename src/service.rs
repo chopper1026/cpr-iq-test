@@ -605,13 +605,35 @@ impl Service {
                 let edit: EditSchedule = parse(payload)?;
                 let settings = edit.settings.into_settings()?;
                 let previous = edit.previous.into_settings()?;
-                if settings.enabled {
+                if schedule_requires_access_check(&previous, &settings) {
                     if self.bank.is_none() {
                         return Err(Reason::DetectorUnavailable.into());
                     }
                     let target = settings.target.as_ref().ok_or(Reason::InvalidInput)?;
-                    host.access(&target.client_key_id, &target.account_ids, &target.model)
-                        .await?;
+                    if let Err((reason, detail)) = host
+                        .access_with_detail(
+                            &target.client_key_id,
+                            &target.account_ids,
+                            &target.model,
+                        )
+                        .await
+                    {
+                        self.log(
+                            "warn",
+                            "schedule",
+                            None,
+                            None,
+                            format!("Schedule access check failed: {reason:?}"),
+                            Some(json!({
+                                "clientKeyId": target.client_key_id,
+                                "model": target.model,
+                                "accountCount": target.account_ids.len(),
+                                "detail": detail,
+                            })),
+                        )
+                        .await;
+                        return Err(reason.into());
+                    }
                 }
                 let at = now();
                 let value = host
@@ -625,6 +647,27 @@ impl Service {
                     })
                     .await
                     .map_err(|e| safe_reason(&e))??;
+                self.log(
+                    "info",
+                    "schedule",
+                    None,
+                    None,
+                    if settings.enabled {
+                        "Scheduled inspection updated (enabled)"
+                    } else {
+                        "Scheduled inspection updated (disabled)"
+                    },
+                    Some(json!({
+                        "enabled": settings.enabled,
+                        "mode": settings.mode,
+                        "hours": settings.hours,
+                        "dailyTimes": settings.daily_times,
+                        "utcOffsetMinutes": settings.utc_offset_minutes,
+                        "autoDisableOnSuspect": settings.auto_disable_on_suspect,
+                        "accountCount": settings.target.as_ref().map(|t| t.account_ids.len()).unwrap_or(0),
+                    })),
+                )
+                .await;
                 Ok((200, value))
             }
             _ => Err(HttpError(404, Reason::InvalidInput)),
@@ -1633,6 +1676,10 @@ fn build_account_statuses(accounts: &[AccountChoice], state: &State, generated_a
     })
 }
 
+fn schedule_requires_access_check(previous: &Settings, next: &Settings) -> bool {
+    next.enabled && (!previous.enabled || next.target != previous.target)
+}
+
 fn schedule_value(state: &State) -> Value {
     json!({
         "settings": state.settings,
@@ -1994,5 +2041,51 @@ mod tests {
             list[3]["lastCheck"]["autoDisableNote"],
             "[指纹异常] 2026-11-26 14:35 UTC+08:00 | 已自动停用"
         );
+    }
+
+    #[test]
+    fn schedule_access_check_runs_on_enable_or_target_change_but_not_guard_only_toggle() {
+        let target_a = Target::new(
+            "key_1".into(),
+            "gpt-6.2-sol".into(),
+            "medium".into(),
+            vec!["acct_a".into()],
+        );
+        let target_b = Target::new(
+            "key_1".into(),
+            "gpt-6.2-sol".into(),
+            "medium".into(),
+            vec!["acct_a".into(), "acct_b".into()],
+        );
+        let disabled = Settings::default();
+        let enabled_a = Settings {
+            enabled: true,
+            target: Some(target_a.clone()),
+            ..Settings::default()
+        };
+        let enabled_a_guard = Settings {
+            auto_disable_on_suspect: true,
+            ..enabled_a.clone()
+        };
+        let enabled_b = Settings {
+            enabled: true,
+            target: Some(target_b),
+            ..Settings::default()
+        };
+        let disabled_a = Settings {
+            enabled: false,
+            target: Some(target_a),
+            ..Settings::default()
+        };
+
+        assert!(schedule_requires_access_check(&disabled, &enabled_a));
+        assert!(schedule_requires_access_check(&disabled_a, &enabled_a));
+        assert!(schedule_requires_access_check(&enabled_a, &enabled_b));
+        assert!(!schedule_requires_access_check(
+            &enabled_a,
+            &enabled_a_guard
+        ));
+        assert!(!schedule_requires_access_check(&enabled_a, &disabled_a));
+        assert!(!schedule_requires_access_check(&disabled, &disabled_a));
     }
 }

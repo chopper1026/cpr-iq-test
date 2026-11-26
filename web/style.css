@@ -892,6 +892,15 @@ h2, p {
   box-shadow: 0 0 0 2px var(--z-color-bg-container, var(--fb-bg-container)), 0 0 0 4px var(--z-control-outline, var(--fb-control-outline));
 }
 
+.z-switch input:disabled + .z-switch-track {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.z-switch:has(input:disabled) {
+  cursor: not-allowed;
+}
+
 .z-switch-label {
   font-weight: 650;
   color: var(--z-color-text, var(--fb-text));
@@ -1175,6 +1184,50 @@ form {
   flex-wrap: wrap;
 }
 
+.schedule-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-radius: var(--z-border-radius, 8px);
+  background: var(--z-color-warning-container, var(--fb-warning-container));
+  color: var(--z-color-warning-on-container, var(--fb-warning-on-container));
+  font-size: var(--z-font-size-xs, 12px);
+  font-weight: 550;
+  line-height: 1.45;
+}
+
+.schedule-banner.is-info {
+  background: var(--z-color-info-container, var(--fb-info-container));
+  color: var(--z-color-info-on-container, var(--fb-info-on-container));
+}
+
+.schedule-banner.is-success {
+  background: var(--z-color-success-container, var(--fb-success-container));
+  color: var(--z-color-success-on-container, var(--fb-success-on-container));
+}
+
+.schedule-banner.is-error {
+  background: var(--z-color-error-container, var(--fb-error-container));
+  color: var(--z-color-error-on-container, var(--fb-error-on-container));
+}
+
+.schedule-banner-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.is-attention-highlight {
+  border-radius: var(--z-border-radius, 8px);
+  box-shadow: 0 0 0 2px var(--z-color-warning, var(--fb-warning)), 0 0 0 5px var(--z-color-warning-container, var(--fb-warning-container));
+  transition: box-shadow 200ms ease;
+}
+
 .schedule-mode-panel {
   padding: 12px;
   border-radius: var(--z-border-radius, 8px);
@@ -1327,6 +1380,14 @@ fieldset {
   font-size: var(--z-font-size-xs, 12px);
   color: var(--z-color-text-secondary, var(--fb-text-secondary));
   overflow-wrap: anywhere;
+}
+
+.notice.is-error {
+  color: var(--z-color-error-on-container, var(--fb-error-on-container));
+}
+
+.notice.is-success {
+  color: var(--z-color-success-on-container, var(--fb-success-on-container));
 }
 
 .notice:empty {
