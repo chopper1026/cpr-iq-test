@@ -1,0 +1,27 @@
+{
+  "detectorRevision": "e0472890bea827d15ca883636a77d4c10bbe843b",
+  "hostCommit": "add1f9f40f79781823475b4ed0f459d3b8c9cb9f",
+  "hostTag": "v3.55.2",
+  "packageSourceHash": "0eefa279caa186fc397dd0c9246bc52d1f43eeb26ab2da2eec1feb52d9c0a753",
+  "platforms": {
+    "aarch64-apple-darwin": {
+      "asset": "cpr-iq-test.account-fingerprint-0.1.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "21037547e7a50ee817be3d491e403928d37924c113d984cca3ca7453dea28776"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "asset": "cpr-iq-test.account-fingerprint-0.1.0-aarch64-unknown-linux-gnu.tar.gz",
+      "maxGlibc": "GLIBC_2.34",
+      "sha256": "b58138d4fecdc76181e64313517e981eeee5c74fd32c05e624beb228ba03eeec"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "asset": "cpr-iq-test.account-fingerprint-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+      "maxGlibc": "GLIBC_2.34",
+      "sha256": "c6e498f855cf4750012d4ae3862f89b74ea3151662ec7a1bb8b99ff29380a6cf"
+    }
+  },
+  "pluginId": "cpr-iq-test.account-fingerprint",
+  "pluginVersion": "0.1.0",
+  "schemaVersion": 1,
+  "sdkFingerprint": "cc4431fd42a3b6e68546017fdab83e6d35565469ca8f21c69c7a6a75e32e5c7f",
+  "sourceCommit": "a373b57fe45c264b443913d0735757cf1c394ce3"
+}
