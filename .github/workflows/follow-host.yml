@@ -1,4 +1,4 @@
-name: Verify new CPR stable releases
+name: Follow CPR and lm-detector releases
 
 on:
   schedule:
@@ -6,19 +6,24 @@ on:
   workflow_dispatch:
     inputs:
       host_tag:
-        description: 'Stable CPR tag to (re)verify, e.g. v3.54.5. Empty uses the current stable release.'
+        description: 'Stable CPR tag to (re)verify, e.g. v3.55.2. Empty uses the latest stable CPR release.'
         type: string
         required: false
       dry_run:
-        description: 'Verify and build artifacts without creating a GitHub Release or updating cpr-compatibility.'
+        description: 'Verify and build artifacts without pushing sync commits, creating a GitHub Release, or updating cpr-compatibility.'
         type: boolean
         required: false
         default: false
       prerelease:
-        description: 'Build a -dev.N preview version and publish it as a GitHub Prerelease (never writes cpr-compatibility or occupies a stable tag).'
+        description: 'Build a -dev.N preview version and publish it as a GitHub Prerelease (never pushes sync commits, writes cpr-compatibility, or occupies a stable tag).'
         type: boolean
         required: false
         default: false
+      sync_upstreams:
+        description: 'Automatically sync updated Codex Proxy (SDK/engines) and lm-detector (data/sdk) pins to default branch before releasing.'
+        type: boolean
+        required: false
+        default: true
       resume_run_id:
         description: 'Prior follow-host.yml run ID at the same commit to resume verification/publish from without rebuilding.'
         type: string
@@ -36,13 +41,104 @@ env:
   CARGO_TERM_COLOR: 'never'
 
 jobs:
-  discover:
+  sync-upstreams:
     if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.resume_run_id == '') &&
+      (github.event_name != 'schedule' || vars.CPR_ENABLE_PUBLISH == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+      synced: ${{ steps.sync.outputs.synced }}
+      needs_sync: ${{ steps.sync.outputs.needs_sync }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ github.token }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Restore locked detector data cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            data/unified_bank.json
+            data/shared_detector.bin
+          key: detector-assets-${{ hashFiles('data/detector.lock.json') }}
+      - name: Restore Cargo build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-sync-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            cargo-sync-${{ runner.os }}-${{ runner.arch }}-
+      - id: sync
+        name: Check and sync Codex Proxy and lm-detector upstream updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_HOST: ${{ inputs.host_tag }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+          SYNC_ENABLED: ${{ github.event_name != 'workflow_dispatch' || inputs.sync_upstreams != false }}
+          ENABLE_PUBLISH: ${{ vars.CPR_ENABLE_PUBLISH }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$GITHUB_SHA"
+          SYNCED="false"
+          if [ "$SYNC_ENABLED" = "true" ]; then
+            can_push="false"
+            if [ "$DRY_RUN" != "true" ] && [ "$PRERELEASE" != "true" ] && [ "$ENABLE_PUBLISH" = "true" ] && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
+              can_push="true"
+            fi
+            args=(--work .work/sync --output .work/sync-report.json --commit-message-out .work/sync-commit.txt --github-output "$GITHUB_OUTPUT")
+            if [ -n "$REQUESTED_HOST" ]; then
+              args+=(--host-tag "$REQUESTED_HOST")
+            fi
+            if [ "$can_push" = "true" ]; then
+              args+=(--apply)
+            fi
+            python scripts/sync_upstreams.py "${args[@]}"
+            if [ "$can_push" = "true" ] && [ -n "$(git status --porcelain -- Cargo.toml Cargo.lock data/detector.lock.json plugin.json rust-toolchain.toml)" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add Cargo.toml Cargo.lock data/detector.lock.json plugin.json rust-toolchain.toml
+              git commit -F .work/sync-commit.txt
+              git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+              SOURCE_SHA="$(git rev-parse HEAD)"
+              SYNCED="true"
+            fi
+          else
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "synced=$SYNCED" >> "$GITHUB_OUTPUT"
+      - if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: upstream-sync-report
+          include-hidden-files: true
+          path: .work/sync-report.json
+          if-no-files-found: ignore
+
+  discover:
+    needs: sync-upstreams
+    if: >-
+      needs.sync-upstreams.result == 'success' &&
       (github.event_name != 'workflow_dispatch' || inputs.resume_run_id == '') &&
       (github.event_name != 'schedule' || vars.CPR_ENABLE_PUBLISH == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     outputs:
+      source_sha: ${{ needs.sync-upstreams.outputs.source_sha }}
       skip: ${{ steps.plan.outputs.skip }}
       host_sha: ${{ steps.plan.outputs.host_sha }}
       host_tag: ${{ steps.plan.outputs.host_tag }}
@@ -53,6 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.sync-upstreams.outputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
@@ -89,6 +186,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.discover.outputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
@@ -148,6 +246,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.discover.outputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
@@ -197,6 +296,7 @@ jobs:
           fi
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.discover.outputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
@@ -246,6 +346,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.discover.outputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
@@ -391,6 +492,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ (github.event_name == 'workflow_dispatch' && inputs.resume_run_id != '') && github.sha || needs.discover.outputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
@@ -437,13 +539,14 @@ jobs:
           CPR_ENABLE_PUBLISH: ${{ vars.CPR_ENABLE_PUBLISH }}
           RESUME_RUN_ID: ${{ inputs.resume_run_id }}
           ALLOW_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+          PUBLISH_SOURCE_SHA: ${{ (github.event_name == 'workflow_dispatch' && inputs.resume_run_id != '') && github.sha || needs.discover.outputs.source_sha }}
         run: |
           options=(
             --plan .work/plan/plan.json
             --decision .work/decision/decision.json
             --input .work/candidates
             --output .work/publish
-            --source "$GITHUB_SHA"
+            --source "$PUBLISH_SOURCE_SHA"
             --resume-run-id "$RESUME_RUN_ID"
             --write
           )

@@ -1,8 +1,8 @@
 //! Management handlers and the single maintenance worker share the same persisted queue.
 use crate::{
     domain::{
-        self, AccountMeta, Decision, Outcome, ProbeDiagnostic, Reason, Round, RunDiagnostic,
-        Settings, State, Target, Task, Verdict,
+        self, AccountMeta, Decision, HistoryItem, Outcome, ProbeDiagnostic, Reason, Round,
+        RunDiagnostic, ScheduleMode, Settings, State, Target, Task, Verdict,
     },
     fingerprint::Fingerprint,
     host::{AccountChoice, DiscoveredModel, Host, safe_reason},
@@ -47,6 +47,7 @@ pub fn registration() -> ManagementRegistration {
     ManagementRegistration {
         routes: vec![
             route("GET", "catalog"),
+            route("GET", "accounts/status"),
             route("GET", "runs"),
             route("POST", "runs"),
             route("POST", "runs/cancel"),
@@ -112,7 +113,16 @@ struct CancelRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SettingsInput {
     enabled: bool,
+    #[serde(default)]
+    mode: ScheduleMode,
+    #[serde(default = "domain::default_hours")]
     hours: u16,
+    #[serde(default = "domain::default_daily_times")]
+    daily_times: Vec<String>,
+    #[serde(default)]
+    utc_offset_minutes: i16,
+    #[serde(default)]
+    auto_disable_on_suspect: bool,
     target: Option<TargetInput>,
 }
 
@@ -121,7 +131,11 @@ impl SettingsInput {
         let target = self.target.map(TargetInput::into_target).transpose()?;
         let mut settings = Settings {
             enabled: self.enabled,
+            mode: self.mode,
             hours: self.hours,
+            daily_times: self.daily_times,
+            utc_offset_minutes: self.utc_offset_minutes,
+            auto_disable_on_suspect: self.auto_disable_on_suspect,
             target,
         };
         settings.normalize()?;
@@ -444,6 +458,16 @@ impl Service {
                     }),
                 ))
             }
+            ("GET", "accounts/status") => {
+                if !request.query.is_empty() {
+                    return Err(Reason::InvalidInput.into());
+                }
+                let accounts = host.all_oauth_accounts().await?;
+                let (mut state, _) = host.load().await.map_err(|e| safe_reason(&e))?;
+                let at = now();
+                state.prune(at);
+                Ok((200, build_account_statuses(&accounts, &state, at)))
+            }
             ("GET", "runs") => {
                 let (mut state, _) = host.load().await.map_err(|e| safe_reason(&e))?;
                 state.prune(now());
@@ -632,7 +656,7 @@ impl Service {
             })
             .await?;
         if let Some(task) = task {
-            let (result, refreshed_meta, diagnostics) = tokio::select! {
+            let (result, refreshed_meta, mut diagnostics) = tokio::select! {
                 biased;
                 () = call.cancellation.cancelled() => (
                     Decision::Finish(failure(Reason::Cancelled)),
@@ -646,8 +670,64 @@ impl Service {
                 ),
                 output = self.run_round(&host, &task) => output,
             };
-            // CAS may retry this *settlement*, but never rerun a model request.
             let at = now();
+            if !call.cancellation.is_cancelled()
+                && let Decision::Finish(outcome) = &result
+                && outcome.verdict == Verdict::Suspect
+                && let Ok((latest_state, _)) = host.load().await
+                && latest_state.settings.auto_disable_on_suspect
+            {
+                let note_line = domain::format_suspect_account_note(
+                    &task.model,
+                    &task.effort,
+                    outcome,
+                    at,
+                    latest_state.settings.utc_offset_minutes,
+                );
+                let diag = diagnostics.get_or_insert_with(|| RunDiagnostic {
+                    round: if task.first_round.is_some() { 2 } else { 1 },
+                    stage: "completed".into(),
+                    ..RunDiagnostic::default()
+                });
+                match host
+                    .disable_account_with_note(&task.account_id, &note_line)
+                    .await
+                {
+                    Ok(res) => {
+                        diag.auto_disabled = Some(true);
+                        diag.auto_disable_note = Some(note_line.clone());
+                        self.log(
+                            "info",
+                            "auto_disable",
+                            Some(&task.run_id),
+                            Some(&task.account_id),
+                            "Auto-disabled suspect account and updated account notes",
+                            Some(json!({
+                                "alreadyDisabled": res.already_disabled,
+                                "note": note_line,
+                            })),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        let detail = crate::host::sanitize_detail(&err, 180);
+                        diag.auto_disabled = Some(false);
+                        diag.auto_disable_error = Some(detail.clone());
+                        self.log(
+                            "warn",
+                            "auto_disable",
+                            Some(&task.run_id),
+                            Some(&task.account_id),
+                            "Failed to auto-disable suspect account",
+                            Some(json!({
+                                "error": detail,
+                            })),
+                        )
+                        .await;
+                    }
+                }
+            }
+            // CAS may retry this *settlement*, but never rerun a model request.
             host.change(|state, _| {
                 state.complete(
                     &task,
@@ -1318,6 +1398,241 @@ fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Reason> {
     serde_json::from_slice(bytes).map_err(|_| Reason::InvalidInput)
 }
 
+fn summarize_history_check(item: &HistoryItem) -> Value {
+    let last_round = item.outcome.last_round.as_ref();
+    let probes_total = item.diagnostics.as_ref().map(|d| d.probes.len());
+    let probes_ok = item
+        .diagnostics
+        .as_ref()
+        .map(|d| d.probes.iter().filter(|p| p.ok).count());
+    json!({
+        "runId": item.run_id,
+        "model": item.model,
+        "effort": item.effort,
+        "scheduled": item.scheduled,
+        "endedAt": item.ended_at,
+        "verdict": item.outcome.verdict,
+        "reason": item.outcome.reason,
+        "roundCount": if item.first_round.is_some() { 2 } else { 1 },
+        "candidates": last_round.map(|r| &r.ranking.candidates),
+        "topMarginBps": last_round.map(|r| r.top_margin_bps),
+        "detectorRevision": last_round.map(|r| &r.detector_revision),
+        "durationMs": item.diagnostics.as_ref().map(|d| d.duration_ms),
+        "probesOk": probes_ok,
+        "probesTotal": probes_total,
+        "errorDetail": item.diagnostics.as_ref().and_then(|d| d.error_detail.as_deref()),
+        "autoDisabled": item.diagnostics.as_ref().and_then(|d| d.auto_disabled),
+        "autoDisableNote": item.diagnostics.as_ref().and_then(|d| d.auto_disable_note.as_deref()),
+        "autoDisableError": item.diagnostics.as_ref().and_then(|d| d.auto_disable_error.as_deref()),
+        "hasDiagnostics": item.diagnostics.is_some(),
+    })
+}
+
+fn build_account_statuses(accounts: &[AccountChoice], state: &State, generated_at: u64) -> Value {
+    let mut active_by_account: BTreeMap<&str, (usize, &Task)> = BTreeMap::new();
+    let mut queued_rank = 0_usize;
+    for task in &state.queue {
+        let position = if task.claimed {
+            0
+        } else {
+            queued_rank += 1;
+            queued_rank
+        };
+        active_by_account
+            .entry(task.account_id.as_str())
+            .or_insert((position, task));
+    }
+
+    let mut history_by_account: BTreeMap<&str, Vec<&HistoryItem>> = BTreeMap::new();
+    for item in &state.history {
+        history_by_account
+            .entry(item.account_id.as_str())
+            .or_default()
+            .push(item);
+    }
+
+    let mut seen_ids = BTreeSet::new();
+    let mut rows = Vec::with_capacity(accounts.len() + state.queue.len());
+    let mut running_count = 0_usize;
+    let mut queued_count = 0_usize;
+    let mut match_count = 0_usize;
+    let mut ranked_count = 0_usize;
+    let mut suspect_count = 0_usize;
+    let mut insufficient_count = 0_usize;
+    let mut failed_count = 0_usize;
+    let mut interrupted_count = 0_usize;
+    let mut skipped_count = 0_usize;
+    let mut untested_count = 0_usize;
+    let mut disabled_count = 0_usize;
+
+    let mut push_entry = |account_id: &str,
+                          email: Option<&str>,
+                          name: &str,
+                          display: &str,
+                          plan_type: Option<&str>,
+                          credential_state: Option<&str>,
+                          credential_revision: Option<u64>,
+                          enabled: bool| {
+        if !enabled {
+            disabled_count += 1;
+        }
+        let active = active_by_account.get(account_id).copied();
+        let items = history_by_account
+            .get(account_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let last_check = items.first().copied();
+        let last_scored = if last_check.is_some_and(|h| h.outcome.last_round.is_none()) {
+            items
+                .iter()
+                .copied()
+                .find(|h| h.outcome.last_round.is_some())
+        } else {
+            None
+        };
+        let live_status = match (active, last_check) {
+            (Some((_, task)), _) if task.claimed => {
+                running_count += 1;
+                "running"
+            }
+            (Some(_), _) => {
+                queued_count += 1;
+                "queued"
+            }
+            (None, Some(item)) => match item.outcome.verdict {
+                Verdict::Match => {
+                    match_count += 1;
+                    "match"
+                }
+                Verdict::Ranked => {
+                    ranked_count += 1;
+                    "ranked"
+                }
+                Verdict::Suspect => {
+                    suspect_count += 1;
+                    "suspect"
+                }
+                Verdict::Insufficient => {
+                    insufficient_count += 1;
+                    "insufficient"
+                }
+                Verdict::Failed => {
+                    failed_count += 1;
+                    "failed"
+                }
+                Verdict::Interrupted => {
+                    interrupted_count += 1;
+                    "interrupted"
+                }
+                Verdict::Skipped => {
+                    skipped_count += 1;
+                    "skipped"
+                }
+            },
+            (None, None) => {
+                untested_count += 1;
+                "untested"
+            }
+        };
+        let active_task = active.map(|(position, task)| {
+            json!({
+                "runId": task.run_id,
+                "status": if task.claimed { "running" } else { "queued" },
+                "round": if task.first_round.is_some() { 2 } else { 1 },
+                "queuePosition": if task.claimed { None } else { Some(position) },
+                "model": task.model,
+                "effort": task.effort,
+                "scheduled": task.scheduled,
+                "queuedAt": task.queued_at,
+            })
+        });
+        let recent_verdicts: Vec<&'static str> = items
+            .iter()
+            .take(5)
+            .map(|item| item.outcome.verdict.as_str())
+            .collect();
+        rows.push(json!({
+            "accountId": account_id,
+            "email": email,
+            "name": name,
+            "display": display,
+            "planType": plan_type,
+            "credentialState": credential_state,
+            "credentialRevision": credential_revision,
+            "enabled": enabled,
+            "liveStatus": live_status,
+            "activeTask": active_task,
+            "lastCheck": last_check.map(summarize_history_check),
+            "lastScored": last_scored.map(summarize_history_check),
+            "recentVerdicts": recent_verdicts,
+            "totalChecks": items.len(),
+        }));
+    };
+
+    for account in accounts {
+        // Show every enabled OAuth account, plus disabled accounts that have detection history or active tasks
+        // (so auto-disabled suspect accounts stay visible with their detection reason and note).
+        if !account.enabled
+            && !active_by_account.contains_key(account.id.as_str())
+            && !history_by_account.contains_key(account.id.as_str())
+        {
+            continue;
+        }
+        seen_ids.insert(account.id.clone());
+        push_entry(
+            &account.id,
+            account.email.as_deref(),
+            &account.name,
+            &account.display,
+            account.plan_type.as_deref(),
+            Some(account.credential_state.as_str()),
+            Some(account.credential_revision),
+            account.enabled,
+        );
+    }
+
+    // Include any account currently queued/running even if it was just removed from the host.
+    for task in &state.queue {
+        if !seen_ids.insert(task.account_id.clone()) {
+            continue;
+        }
+        let display = task
+            .account_email
+            .as_deref()
+            .or(task.account_name.as_deref())
+            .unwrap_or(task.account_id.as_str());
+        push_entry(
+            &task.account_id,
+            task.account_email.as_deref(),
+            task.account_name.as_deref().unwrap_or(""),
+            display,
+            None,
+            None,
+            None,
+            false,
+        );
+    }
+
+    json!({
+        "generatedAt": generated_at,
+        "summary": {
+            "total": rows.len(),
+            "running": running_count,
+            "queued": queued_count,
+            "match": match_count,
+            "ranked": ranked_count,
+            "suspect": suspect_count,
+            "insufficient": insufficient_count,
+            "failed": failed_count,
+            "interrupted": interrupted_count,
+            "skipped": skipped_count,
+            "untested": untested_count,
+            "disabled": disabled_count,
+        },
+        "accounts": rows,
+    })
+}
+
 fn schedule_value(state: &State) -> Value {
     json!({
         "settings": state.settings,
@@ -1488,5 +1803,196 @@ mod tests {
         assert_eq!(bundle["records"][0]["diagnostics"]["stage"], "completed");
         assert_eq!(bundle["runtimeLogCount"], 1);
         assert_eq!(bundle["runtimeLogs"][0]["runId"], "m-hist0000");
+    }
+
+    #[test]
+    fn account_statuses_merge_live_queue_latest_check_and_fallback_scored() {
+        use crate::domain::{Candidate, Ranking};
+        let mut state = State::default();
+        let accounts = vec![
+            AccountChoice {
+                id: "acct_a".into(),
+                email: Some("alice@example.com".into()),
+                name: "Alice".into(),
+                plan_type: Some("pro".into()),
+                enabled: true,
+                credential_state: "ready".into(),
+                credential_revision: 4,
+                display: "alice@example.com".into(),
+            },
+            AccountChoice {
+                id: "acct_b".into(),
+                email: Some("bob@example.com".into()),
+                name: "".into(),
+                plan_type: Some("plus".into()),
+                enabled: true,
+                credential_state: "ready".into(),
+                credential_revision: 2,
+                display: "bob@example.com".into(),
+            },
+            AccountChoice {
+                id: "acct_c".into(),
+                email: Some("carol@example.com".into()),
+                name: "".into(),
+                plan_type: Some("team".into()),
+                enabled: true,
+                credential_state: "ready".into(),
+                credential_revision: 1,
+                display: "carol@example.com".into(),
+            },
+            AccountChoice {
+                id: "acct_d".into(),
+                email: Some("dave@example.com".into()),
+                name: "Dave".into(),
+                plan_type: Some("pro".into()),
+                enabled: false,
+                credential_state: "ready".into(),
+                credential_revision: 7,
+                display: "dave@example.com".into(),
+            },
+            AccountChoice {
+                id: "acct_e".into(),
+                email: Some("eve@example.com".into()),
+                name: "Eve".into(),
+                plan_type: Some("plus".into()),
+                enabled: false,
+                credential_state: "ready".into(),
+                credential_revision: 1,
+                display: "eve@example.com".into(),
+            },
+        ];
+        let labels = BTreeMap::from([("acct_a".into(), accounts[0].meta())]);
+        state
+            .enqueue_manual(
+                "m-live123456".into(),
+                Target::new(
+                    "key_1".into(),
+                    "gpt-6.2-sol".into(),
+                    "high".into(),
+                    vec!["acct_a".into()],
+                ),
+                5000,
+                &labels,
+            )
+            .unwrap();
+        let _ = state.claim().unwrap();
+
+        // acct_b latest run failed, previous run had a match score
+        state.history.push(HistoryItem {
+            run_id: "m-b-fail".into(),
+            account_id: "acct_b".into(),
+            account_email: Some("bob@example.com".into()),
+            account_name: None,
+            model: "gpt-6.2-sol".into(),
+            effort: "high".into(),
+            legacy_profile_id: None,
+            scheduled: true,
+            ended_at: 4000,
+            plugin_version: "0.1.0".into(),
+            first_round: None,
+            outcome: Outcome::no_rank(Verdict::Failed, Reason::RateLimited),
+            diagnostics: None,
+        });
+        state.history.push(HistoryItem {
+            run_id: "m-b-ok".into(),
+            account_id: "acct_b".into(),
+            account_email: Some("bob@example.com".into()),
+            account_name: None,
+            model: "gpt-6.2-sol".into(),
+            effort: "high".into(),
+            legacy_profile_id: None,
+            scheduled: false,
+            ended_at: 3000,
+            plugin_version: "0.1.0".into(),
+            first_round: None,
+            outcome: Outcome {
+                verdict: Verdict::Match,
+                reason: None,
+                last_round: Some(Round {
+                    ranking: Ranking {
+                        candidates: vec![Candidate {
+                            id: "gpt-6.2-sol".into(),
+                            label: "gpt-6.2-sol".into(),
+                            probability_bps: Some(9500),
+                        }],
+                    },
+                    stamp: "s".into(),
+                    detector_revision: "rev".into(),
+                    top_margin_bps: 8000,
+                }),
+            },
+            diagnostics: None,
+        });
+
+        // acct_d was auto-disabled after Suspect -> must remain visible with autoDisabled audit fields
+        state.history.push(HistoryItem {
+            run_id: "m-d-suspect".into(),
+            account_id: "acct_d".into(),
+            account_email: Some("dave@example.com".into()),
+            account_name: Some("Dave".into()),
+            model: "gpt-6.2-sol".into(),
+            effort: "high".into(),
+            legacy_profile_id: None,
+            scheduled: false,
+            ended_at: 4500,
+            plugin_version: "0.1.0".into(),
+            first_round: None,
+            outcome: Outcome {
+                verdict: Verdict::Suspect,
+                reason: None,
+                last_round: Some(Round {
+                    ranking: Ranking {
+                        candidates: vec![Candidate {
+                            id: "gpt-5.3-codex".into(),
+                            label: "gpt-5.3-codex".into(),
+                            probability_bps: Some(9300),
+                        }],
+                    },
+                    stamp: "s".into(),
+                    detector_revision: "rev".into(),
+                    top_margin_bps: 8100,
+                }),
+            },
+            diagnostics: Some(RunDiagnostic {
+                round: 2,
+                stage: "completed".into(),
+                duration_ms: 9100,
+                auto_disabled: Some(true),
+                auto_disable_note: Some(
+                    "[指纹异常] 2026-11-26 14:35 UTC+08:00 | 已自动停用".into(),
+                ),
+                ..RunDiagnostic::default()
+            }),
+        });
+
+        let payload = build_account_statuses(&accounts, &state, 6000);
+        // acct_e is disabled with no history so it is omitted; acct_d IS included.
+        assert_eq!(payload["summary"]["total"], 4);
+        assert_eq!(payload["summary"]["running"], 1);
+        assert_eq!(payload["summary"]["failed"], 1);
+        assert_eq!(payload["summary"]["untested"], 1);
+        assert_eq!(payload["summary"]["suspect"], 1);
+        assert_eq!(payload["summary"]["disabled"], 1);
+
+        let list = payload["accounts"].as_array().unwrap();
+        assert_eq!(list[0]["accountId"], "acct_a");
+        assert_eq!(list[0]["liveStatus"], "running");
+        assert_eq!(list[0]["activeTask"]["status"], "running");
+        assert_eq!(list[1]["accountId"], "acct_b");
+        assert_eq!(list[1]["liveStatus"], "failed");
+        assert_eq!(list[1]["lastCheck"]["runId"], "m-b-fail");
+        assert_eq!(list[1]["lastScored"]["runId"], "m-b-ok");
+        assert_eq!(list[1]["recentVerdicts"], json!(["failed", "match"]));
+        assert_eq!(list[2]["accountId"], "acct_c");
+        assert_eq!(list[2]["liveStatus"], "untested");
+        assert!(list[2]["lastCheck"].is_null());
+        assert_eq!(list[3]["accountId"], "acct_d");
+        assert_eq!(list[3]["enabled"], false);
+        assert_eq!(list[3]["liveStatus"], "suspect");
+        assert_eq!(list[3]["lastCheck"]["autoDisabled"], true);
+        assert_eq!(
+            list[3]["lastCheck"]["autoDisableNote"],
+            "[指纹异常] 2026-11-26 14:35 UTC+08:00 | 已自动停用"
+        );
     }
 }

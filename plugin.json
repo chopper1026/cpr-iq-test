@@ -4,7 +4,7 @@
   "name": "account-fingerprint",
   "displayName": "Codex 账号指纹巡检",
   "version": "0.1.0",
-  "description": "指定账号的模型参考指纹检测，不改变账号状态或路由。",
+  "description": "指定账号的模型参考指纹检测与定时巡检，支持可选的指纹异常自动停用与备注记录。",
   "license": "Apache-2.0",
   "engines": { "codex-proxy-rs": "~3.54.5" },
   "main": "bin/plugin",

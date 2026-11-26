@@ -1,6 +1,10 @@
-//! CPR wire adapter. No raw credential, generic HTTP, or data-plane mutations are used.
+//! CPR wire adapter. No raw credential or generic outbound HTTP is used; account disable/note
+//! updates use the sanctioned internal admin HTTP dispatch path only when explicitly opted in.
 use crate::{
-    domain::{AccountMeta, DEFAULT_EFFORT, Reason, State, valid_effort, valid_id, valid_model_id},
+    domain::{
+        AccountMeta, DEFAULT_EFFORT, Reason, State, merge_account_notes, valid_effort, valid_id,
+        valid_model_id,
+    },
     state_codec,
 };
 use gateway_plugin_sdk::{
@@ -8,7 +12,7 @@ use gateway_plugin_sdk::{
     call::{
         data::AccessQuery,
         host::{self as wire, *},
-        middleware::http as http_wire,
+        middleware::{MiddlewareHeader, http as http_wire},
         model::{CanonicalEvent, ExecutionEvent, FinishReason, WirePayload},
     },
     client::{HostClient, HostReply, HttpBody, HttpFrame, HttpRequest, SessionError},
@@ -188,8 +192,16 @@ pub struct AccountChoice {
     pub email: Option<String>,
     pub name: String,
     pub plan_type: Option<String>,
+    pub enabled: bool,
+    pub credential_state: String,
     pub credential_revision: u64,
     pub display: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountDisableResult {
+    pub note: String,
+    pub already_disabled: bool,
 }
 
 impl AccountChoice {
@@ -207,6 +219,7 @@ impl AccountChoice {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| truncate(value, 64));
+        let credential_state = truncate(account.credential_state.trim(), 64);
         let display = if let Some(email) = &email {
             email.clone()
         } else if !name.is_empty() && name != account.account_id {
@@ -219,6 +232,8 @@ impl AccountChoice {
             email,
             name,
             plan_type,
+            enabled: account.enabled,
+            credential_state,
             credential_revision: account.credential_revision,
             display,
         }
@@ -323,6 +338,17 @@ pub struct Host<'a>(pub &'a HostClient);
 
 impl Host<'_> {
     pub async fn accounts(&self) -> Result<Vec<AccountChoice>, Reason> {
+        self.list_oauth_accounts(false).await
+    }
+
+    pub async fn all_oauth_accounts(&self) -> Result<Vec<AccountChoice>, Reason> {
+        self.list_oauth_accounts(true).await
+    }
+
+    async fn list_oauth_accounts(
+        &self,
+        include_disabled: bool,
+    ) -> Result<Vec<AccountChoice>, Reason> {
         let mut cursor = None;
         let mut accounts = vec![];
         loop {
@@ -340,7 +366,13 @@ impl Host<'_> {
             accounts.extend(
                 page.accounts
                     .into_iter()
-                    .filter(eligible)
+                    .filter(|account| {
+                        if include_disabled {
+                            is_openai_oauth(account)
+                        } else {
+                            eligible(account)
+                        }
+                    })
                     .map(AccountChoice::from_runtime),
             );
             match page.next_cursor {
@@ -470,20 +502,73 @@ impl Host<'_> {
         Ok(parse_account_models_envelope(&body))
     }
 
+    pub async fn disable_account_with_note(
+        &self,
+        account_id: &str,
+        note_line: &str,
+    ) -> Result<AccountDisableResult, String> {
+        if !valid_id(account_id, 128) {
+            return Err("invalid account id".into());
+        }
+        let detail = self
+            .dispatch_get_json(&format!(
+                "/api/admin/accounts/detail?accountId={account_id}"
+            ))
+            .await
+            .map_err(|e| format!("fetch account detail failed: {e}"))?;
+        let (update_body, merged_notes, already_disabled) =
+            build_disable_account_update_payload(&detail, account_id, note_line)?;
+        let _ = self
+            .dispatch_post_json("/api/admin/accounts/update", &update_body)
+            .await
+            .map_err(|e| format!("update account failed: {e}"))?;
+        Ok(AccountDisableResult {
+            note: merged_notes,
+            already_disabled,
+        })
+    }
+
     async fn dispatch_get_json(&self, uri: &str) -> Result<Value, String> {
+        self.dispatch_json("GET", uri, None).await
+    }
+
+    async fn dispatch_post_json(&self, uri: &str, body: &Value) -> Result<Value, String> {
+        self.dispatch_json("POST", uri, Some(body)).await
+    }
+
+    async fn dispatch_json(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, String> {
+        let (headers, http_body) = match body {
+            Some(payload) => {
+                let encoded = serde_json::to_vec(payload)
+                    .map_err(|_| "failed to encode request json".to_owned())?;
+                (
+                    vec![MiddlewareHeader {
+                        name: "content-type".into(),
+                        value: b"application/json".to_vec(),
+                    }],
+                    HttpBody::from_bytes(encoded),
+                )
+            }
+            None => (vec![], HttpBody::empty()),
+        };
         let mut response = self
             .0
             .dispatch_http(HttpRequest {
                 settings: Value::Null,
-                method: "GET".into(),
+                method: method.into(),
                 uri: uri.into(),
                 version: http_wire::Version::Http11,
-                headers: vec![],
+                headers,
                 timeout_ms: Some(15_000),
-                body: HttpBody::empty(),
+                body: http_body,
             })
             .await
-            .map_err(|_| "dispatch_http failed".to_owned())?;
+            .map_err(|e| format!("dispatch_http failed: {}", fault_detail(&e)))?;
         let mut bytes = Vec::new();
         while let Some(frame) = response
             .body
@@ -494,15 +579,29 @@ impl Host<'_> {
             if let HttpFrame::Data(chunk) = frame {
                 if bytes.len().saturating_add(chunk.len()) > MAX_CATALOG_BODY {
                     let _ = response.body.close().await;
-                    return Err("catalog response too large".into());
+                    return Err("host response too large".into());
                 }
                 bytes.extend_from_slice(&chunk);
             }
         }
         if !(200..300).contains(&response.status) {
-            return Err(format!("HTTP {}", response.status));
+            let msg = serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .or_else(|| v.pointer("/error/message"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+            let detail = sanitize_detail(&msg, 140);
+            return Err(if detail.is_empty() {
+                format!("HTTP {}", response.status)
+            } else {
+                format!("HTTP {}: {detail}", response.status)
+            });
         }
-        serde_json::from_slice(&bytes).map_err(|_| "invalid catalog json".to_owned())
+        serde_json::from_slice(&bytes).map_err(|_| "invalid host json".to_owned())
     }
 
     async fn list_models(&self, client_key_id: &str) -> Result<Vec<String>, Reason> {
@@ -831,8 +930,62 @@ fn parse_account_models_envelope(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn build_disable_account_update_payload(
+    detail: &Value,
+    account_id: &str,
+    note_line: &str,
+) -> Result<(Value, String, bool), String> {
+    let account = detail
+        .pointer("/data/account")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "missing data.account in detail response".to_owned())?;
+    let weight = account
+        .get("weight")
+        .and_then(Value::as_u64)
+        .filter(|&w| w >= 1)
+        .ok_or_else(|| "missing valid account weight".to_owned())?;
+    let concurrency_limit = match account.get("concurrencyLimit") {
+        Some(Value::Null) | None => Value::Null,
+        Some(Value::Number(num)) if num.as_u64().is_some_and(|n| n >= 1) => {
+            Value::Number(num.clone())
+        }
+        _ => return Err("invalid account concurrencyLimit".into()),
+    };
+    let groups = account
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing account groups array".to_owned())?;
+    let mut group_ids = Vec::with_capacity(groups.len());
+    for group in groups {
+        let id = group
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| "invalid group id in account detail".to_owned())?;
+        group_ids.push(id.to_owned());
+    }
+    let existing_notes = account.get("notes").and_then(Value::as_str);
+    let already_disabled = account.get("enabled").and_then(Value::as_bool) == Some(false);
+    let merged_notes = merge_account_notes(existing_notes, note_line);
+    // Omit `name`, `outboundProxyId`, `modelAccess`, and `connection` so CPR preserves
+    // the account's name, proxy, model access rules, quota settings, and credentials untouched.
+    let update_body = json!({
+        "accountId": account_id,
+        "notes": merged_notes,
+        "enabled": false,
+        "concurrencyLimit": concurrency_limit,
+        "weight": weight,
+        "groupIds": group_ids,
+    });
+    Ok((update_body, merged_notes, already_disabled))
+}
+
+fn is_openai_oauth(account: &AuthRuntimeAccount) -> bool {
+    account.provider_id == PROVIDER && account.authentication_kind == "oauth"
+}
+
 fn eligible(account: &AuthRuntimeAccount) -> bool {
-    account.provider_id == PROVIDER && account.authentication_kind == "oauth" && account.enabled
+    is_openai_oauth(account) && account.enabled
 }
 
 async fn account_info(
@@ -1465,6 +1618,72 @@ mod tests {
         assert_eq!(choice.display, "alice@example.com");
         assert_eq!(choice.email.as_deref(), Some("alice@example.com"));
         assert_eq!(choice.plan_type.as_deref(), Some("plus"));
+        assert!(choice.enabled);
+        assert_eq!(choice.credential_state, "ready");
+    }
+
+    #[test]
+    fn disable_account_update_payload_preserves_scheduling_groups_and_merges_notes() {
+        let detail = json!({
+            "code": 200,
+            "message": "OK",
+            "data": {
+                "account": {
+                    "id": "acct_0123456789",
+                    "name": "Team Primary",
+                    "notes": "原始手工备注",
+                    "enabled": true,
+                    "concurrencyLimit": 4,
+                    "weight": 120,
+                    "outboundProxyId": "proxy_us_1",
+                    "modelAccess": {"mode": "allowlist", "models": ["gpt-6.2-sol"]},
+                    "groups": [
+                        {"id": "grp_prod", "name": "Prod", "color": "#5983f4", "enabled": true},
+                        {"id": "grp_vip", "name": "VIP", "color": "#12b981", "enabled": true}
+                    ]
+                }
+            }
+        });
+        let entry = "[指纹异常] 2026-11-26 14:35 UTC+08:00 | gpt-6.2-sol(high) 两轮复测疑似异常，判定 #1 gpt-5.3-codex(94.2%)，已自动停用";
+        let (body, merged, already_disabled) =
+            build_disable_account_update_payload(&detail, "acct_0123456789", entry).unwrap();
+        assert!(!already_disabled);
+        assert_eq!(merged, format!("{entry}\n原始手工备注"));
+        assert_eq!(body["accountId"], "acct_0123456789");
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["notes"], merged);
+        assert_eq!(body["concurrencyLimit"], 4);
+        assert_eq!(body["weight"], 120);
+        assert_eq!(body["groupIds"], json!(["grp_prod", "grp_vip"]));
+        // Must omit fields we do not own so Postgres preserves them untouched.
+        assert!(body.get("name").is_none());
+        assert!(body.get("outboundProxyId").is_none());
+        assert!(body.get("modelAccess").is_none());
+        assert!(body.get("connection").is_none());
+
+        // Null concurrencyLimit and already disabled account
+        let detail_null = json!({
+            "data": {
+                "account": {
+                    "id": "acct_0123456789",
+                    "enabled": false,
+                    "concurrencyLimit": null,
+                    "weight": 100,
+                    "groups": []
+                }
+            }
+        });
+        let (body2, _, already_disabled2) =
+            build_disable_account_update_payload(&detail_null, "acct_0123456789", entry).unwrap();
+        assert!(already_disabled2);
+        assert!(body2["concurrencyLimit"].is_null());
+        assert_eq!(body2["groupIds"], json!([]));
+
+        // Missing groups or invalid weight must fail closed rather than clearing host config
+        let bad_detail = json!({"data": {"account": {"weight": 100}}});
+        assert!(
+            build_disable_account_update_payload(&bad_detail, "acct_0123456789", entry).is_err()
+        );
     }
 
     #[test]

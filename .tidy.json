@@ -85,6 +85,10 @@
       },
       {
         "document": "README.md",
+        "target": "scripts/sync_upstreams.py"
+      },
+      {
+        "document": "README.md",
         "target": "src/host.rs"
       },
       {
@@ -130,6 +134,10 @@
       {
         "document": "docs/release.md",
         "target": "scripts/release_gate.py"
+      },
+      {
+        "document": "docs/release.md",
+        "target": "scripts/sync_upstreams.py"
       },
       {
         "document": "docs/release.md",
@@ -186,6 +194,10 @@
       {
         "document": "docs/development/HANDOFF.md",
         "target": ".github/workflows/follow-host.yml"
+      },
+      {
+        "document": "docs/development/HANDOFF.md",
+        "target": "scripts/sync_upstreams.py"
       },
       {
         "document": "docs/development/HANDOFF.md",

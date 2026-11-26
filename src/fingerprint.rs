@@ -243,12 +243,21 @@ fn verify(file: &Path, expected: &LockedAsset) -> Result<(), Reason> {
 }
 
 #[cfg(test)]
+fn test_data_dir() -> std::path::PathBuf {
+    let cwd_data = std::path::Path::new("data");
+    if cwd_data.join("unified_bank.json").is_file() {
+        return cwd_data.to_path_buf();
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("data")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn bank_loads_offline_checks_assets_matches_aliases_and_generates_independent_challenges() {
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let directory = test_data_dir();
         let bank = Fingerprint::load(&directory).ok();
         if std::env::var_os("CPR_REQUIRE_BANK").is_some() {
             assert!(bank.is_some(), "locked pair must work offline");
@@ -291,7 +300,7 @@ mod tests {
 #[test]
 fn a_known_different_label_repeats_with_independent_upstream_replies() {
     use crate::domain::{self, Decision as VerdictDecision, Verdict};
-    let Ok(bank) = Fingerprint::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("data")) else {
+    let Ok(bank) = Fingerprint::load(&test_data_dir()) else {
         assert!(
             std::env::var_os("CPR_REQUIRE_BANK").is_none(),
             "detector data required"

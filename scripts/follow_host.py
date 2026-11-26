@@ -19,11 +19,24 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from detector_assets import ROOT, file_sha
+from detector_assets import ROOT, bank_lock, file_sha
 from package import ID, TRIPLES, rust_channel
 
 UPSTREAM = "zyycn/codex-proxy-rs"
+LM_UPSTREAM = "Ikaleio/lm-detector"
 LEDGER_BRANCH = "cpr-compatibility"
+PACKAGE_SOURCE_FILES = (
+    "Cargo.toml",
+    "Cargo.lock",
+    "build.rs",
+    "plugin.json",
+    "rust-toolchain.toml",
+    "data/detector.lock.json",
+    "LICENSE",
+    "LICENSE-lm-detector",
+    "THIRD_PARTY.md",
+)
+PACKAGE_SOURCE_DIRS = ("src", "web")
 SDK = pathlib.Path("backend/crates/gateway-plugin/sdk")
 RUNTIME = SDK.parent / "runtime"
 RELEASE_MANIFEST = pathlib.Path("plugins/official/plugin-release-manifest.json")
@@ -248,6 +261,38 @@ def package_manifest(archive):
         return json.load(tar.extractfile(members[0]))
 
 
+def parse_semver(version):
+    match = STABLE.fullmatch("v" + version.removeprefix("v"))
+    if not match:
+        raise ValueError(f"Not a stable semantic version: {version}")
+    return tuple(int(part) for part in match.groups())
+
+
+def package_source_hash(root=ROOT):
+    """Deterministic SHA-256 over all files that affect the built plugin package."""
+    root = pathlib.Path(root)
+    paths = []
+    for rel in PACKAGE_SOURCE_FILES:
+        candidate = root / rel
+        if candidate.is_file():
+            paths.append(candidate)
+    for directory in PACKAGE_SOURCE_DIRS:
+        base = root / directory
+        if base.is_dir():
+            paths.extend(
+                p for p in base.rglob("*")
+                if p.is_file() and "__pycache__" not in p.parts and p.name != ".DS_Store"
+            )
+    hasher = hashlib.sha256()
+    for path in sorted(set(paths), key=lambda p: p.relative_to(root).as_posix()):
+        rel = path.relative_to(root).as_posix()
+        hasher.update(rel.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(file_sha(path).encode("ascii"))
+        hasher.update(b"\n")
+    return hasher.hexdigest()
+
+
 def engine_matches(requirement, tag):
     # All our builds use a tilde and all three components. Unknown syntax must not be interpreted as compatible.
     lower = STABLE.fullmatch("v" + requirement[1:]) if requirement.startswith("~") else None
@@ -307,8 +352,23 @@ def discovery(args):
     known = ledger(repo, tag)
     if known and known["hostCommit"] != sha:
         raise ValueError("Published upstream tag moved: stop rather than overwriting compatibility evidence")
-    result = {"hostTag": tag, "hostCommit": sha, "hostAssets": slim_assets(release["assets"]), "repository": repo,
-              "prerelease": prerelease, "skip": bool(known and not manual and not prerelease)}
+    detector_rev = bank_lock()["revision"]
+    source_hash = package_source_hash()
+    known_current = bool(
+        known
+        and known.get("detectorRevision") == detector_rev
+        and known.get("packageSourceHash") == source_hash
+    )
+    result = {
+        "hostTag": tag,
+        "hostCommit": sha,
+        "hostAssets": slim_assets(release["assets"]),
+        "repository": repo,
+        "prerelease": prerelease,
+        "detectorRevision": detector_rev,
+        "packageSourceHash": source_hash,
+        "skip": bool(known_current and not manual and not prerelease),
+    }
     contract_ok = False
     has_previous = False
     if not result["skip"]:
@@ -331,9 +391,14 @@ def discovery(args):
                      and "verification.json" in slim_assets(item["assets"])]
         if known and not prerelease:
             known_tag = "v" + known["pluginVersion"]
-            available = [rel for rel in available if rel["tag_name"] == known_tag]
-            if not available:
-                raise ValueError("Recorded verified plugin release is missing; do not silently rewrite the compatibility table")
+            if known_current:
+                available = [rel for rel in available if rel["tag_name"] == known_tag]
+                if not available:
+                    raise ValueError("Recorded verified plugin release is missing; do not silently rewrite the compatibility table")
+            else:
+                # Current detector or plugin package source differs from the recorded ledger entry:
+                # force a fresh rebuild so the new stable version supersedes the recorded entry cleanly.
+                available = []
         tool_source = host_source(sha, args.work)
         base_pin = cargo["dependencies"]["gateway-plugin-sdk"]["rev"]
         base = host_source(base_pin, args.work)

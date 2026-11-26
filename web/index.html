@@ -8,156 +8,257 @@
   <script defer src="app.js"></script>
 </head>
 <body>
-<main>
-  <header class="overview">
-    <div>
-      <p class="eyebrow">OpenAI · OAuth</p>
-      <h1>账号指纹巡检</h1>
-      <p class="muted">对指定账号执行手动检测或定时巡检，自动拉取宿主全部模型及推理档位，结果不改变账号状态或路由。</p>
+<main class="page">
+  <div class="topbar">
+    <nav class="z-segmented top-tabs" role="tablist" aria-label="功能分区">
+      <button type="button" class="z-seg-item is-active" id="tab-status" role="tab" aria-selected="true" aria-controls="panel-status">
+        <span>账号状态</span>
+        <span class="seg-badge" id="tab-status-badge">0</span>
+      </button>
+      <button type="button" class="z-seg-item" id="tab-detect" role="tab" aria-selected="false" aria-controls="panel-detect">
+        <span>检测与巡检</span>
+      </button>
+      <button type="button" class="z-seg-item" id="tab-records" role="tab" aria-selected="false" aria-controls="panel-records">
+        <span>任务记录</span>
+        <span class="seg-badge" id="tab-records-badge">0</span>
+      </button>
+    </nav>
+    <div class="topbar-actions">
+      <span class="live-chip" id="live-indicator" title="页面可见时每 5 秒自动刷新实时状态">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="live-updated">实时同步</span>
+      </span>
+      <button class="z-btn z-btn-secondary z-btn-sm" type="button" id="refresh">刷新目录</button>
     </div>
-    <div class="header-actions">
-      <button class="secondary" type="button" id="refresh">刷新目录</button>
-    </div>
-  </header>
+  </div>
 
-  <p id="accessible-status" class="message" role="status" aria-live="polite">正在读取插件状态…</p>
+  <p id="accessible-status" class="z-alert" role="status" aria-live="polite">正在读取插件状态…</p>
+  <p id="last-skip" class="z-alert is-warning" hidden></p>
 
-  <dl class="summary">
-    <div>
-      <dt>任务队列</dt>
-      <dd id="queue-count">—</dd>
-    </div>
-    <div>
-      <dt>定时巡检</dt>
-      <dd class="date" id="due">—</dd>
-    </div>
-    <div class="summary-link" id="summary-records-card" role="button" tabindex="0" aria-label="查看任务记录">
-      <dt>检测记录</dt>
-      <dd id="history-summary">—</dd>
-    </div>
-  </dl>
-
-  <p id="last-skip" class="message" hidden></p>
-
-  <nav class="tabs" role="tablist" aria-label="功能分区">
-    <button type="button" class="tab active" id="tab-detect" role="tab" aria-selected="true" aria-controls="panel-detect">
-      检测与巡检
+  <section class="kpi-grid" aria-label="巡检概览">
+    <button type="button" class="z-card kpi-card" id="kpi-status-card">
+      <span class="kpi-label">账号实时状态</span>
+      <strong class="kpi-value" id="kpi-accounts">—</strong>
+      <span class="kpi-sub" id="kpi-accounts-sub">加载中…</span>
     </button>
-    <button type="button" class="tab" id="tab-records" role="tab" aria-selected="false" aria-controls="panel-records">
-      任务记录 <span class="tab-badge" id="tab-records-badge">0</span>
+    <button type="button" class="z-card kpi-card" id="kpi-queue-card">
+      <span class="kpi-label">当前任务队列</span>
+      <strong class="kpi-value" id="queue-count">—</strong>
+      <span class="kpi-sub" id="queue-sub">串行探针调度</span>
     </button>
-  </nav>
+    <button type="button" class="z-card kpi-card" id="kpi-schedule-card">
+      <span class="kpi-label">定时巡检计划</span>
+      <strong class="kpi-value kpi-value-sm" id="due">—</strong>
+      <span class="kpi-sub" id="due-sub">支持按间隔或每日固定时间</span>
+    </button>
+    <button type="button" class="z-card kpi-card" id="summary-records-card">
+      <span class="kpi-label">最近 30 天记录</span>
+      <strong class="kpi-value" id="history-summary">—</strong>
+      <span class="kpi-sub" id="history-sub">最多保留 500 条摘要</span>
+    </button>
+  </section>
 
-  <section id="panel-detect" role="tabpanel" aria-labelledby="tab-detect">
+  <!-- Tab 1: 账号实时状态 -->
+  <section id="panel-status" role="tabpanel" aria-labelledby="tab-status">
+    <section class="z-card" aria-labelledby="status-title">
+      <div class="card-head">
+        <div>
+          <h2 id="status-title">账号实时状态</h2>
+          <p class="card-desc">实时汇总 OpenAI OAuth 账号的当前队列进度与最近一次指纹检测结论；开启「异常自动停用」后，仅对两轮确认的疑似异常账号自动停用并写入备注。</p>
+        </div>
+        <div class="head-actions">
+          <button type="button" class="z-btn z-btn-plain z-btn-sm" id="goto-detect-from-status">批量检测 / 巡检设置</button>
+          <button type="button" class="z-btn z-btn-secondary z-btn-sm" id="refresh-status">刷新状态</button>
+        </div>
+      </div>
+
+      <div class="quick-pills" id="status-pills" role="group" aria-label="按实时状态筛选">
+        <button type="button" class="z-pill is-active" data-status="">全部 <span data-status-count="total">0</span></button>
+        <button type="button" class="z-pill" data-status="running">检测中 <span data-status-count="running">0</span></button>
+        <button type="button" class="z-pill" data-status="queued">排队中 <span data-status-count="queued">0</span></button>
+        <button type="button" class="z-pill" data-status="match">指纹匹配 <span data-status-count="match">0</span></button>
+        <button type="button" class="z-pill" data-status="ranked">参考排名 <span data-status-count="ranked">0</span></button>
+        <button type="button" class="z-pill" data-status="suspect">疑似异常 <span data-status-count="suspect">0</span></button>
+        <button type="button" class="z-pill" data-status="attention">失败 / 不足 <span data-status-count="attention">0</span></button>
+        <button type="button" class="z-pill" data-status="untested">未检测 <span data-status-count="untested">0</span></button>
+      </div>
+
+      <div class="toolbar status-toolbar">
+        <div class="z-input-wrap">
+          <span class="z-input-icon" aria-hidden="true">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          </span>
+          <input class="z-input z-input-sm has-icon" type="search" id="status-search" placeholder="搜索账号邮箱、名称、ID 或最近模型…" aria-label="搜索账号状态">
+        </div>
+        <div id="status-plan-host"></div>
+        <div id="status-sort-host"></div>
+        <button type="button" class="z-btn z-btn-secondary z-btn-sm" id="status-reset" disabled>重置</button>
+      </div>
+
+      <p class="notice" id="status-notice" role="status"></p>
+      <p class="empty-box" id="status-empty">正在加载账号实时状态…</p>
+
+      <div class="table-scroll" id="status-table-wrap" hidden>
+        <table class="z-table">
+          <caption class="sr-only">OpenAI OAuth 账号实时指纹状态</caption>
+          <thead>
+            <tr>
+              <th scope="col">账号</th>
+              <th scope="col">实时状态</th>
+              <th scope="col">最近一次检测</th>
+              <th scope="col">检测时间 / 耗时</th>
+              <th scope="col">操作</th>
+            </tr>
+          </thead>
+          <tbody id="status-rows"></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+
+  <!-- Tab 2: 检测与巡检 -->
+  <section id="panel-detect" role="tabpanel" aria-labelledby="tab-detect" hidden>
+    <section class="z-card policy-card" aria-labelledby="policy-title">
+      <div class="policy-row">
+        <div class="policy-info">
+          <div class="policy-head">
+            <h2 id="policy-title">异常自动停用</h2>
+            <span class="z-tag z-tag-xs" id="policy-badge">已关闭</span>
+          </div>
+          <p class="card-desc">默认关闭。开启后，当账号经两轮独立复测确认为「疑似指纹异常」时（手动检测与定时巡检均生效），自动在宿主中停用该账号，并将检测结果与时间写入对应账号的备注（保留原有备注）；检测失败、证据不足或库外参考排名不会触发。</p>
+        </div>
+        <div class="policy-control">
+          <label class="z-switch">
+            <input id="auto-disable-on-suspect" type="checkbox" role="switch" disabled>
+            <span class="z-switch-track" aria-hidden="true"><span class="z-switch-thumb"></span></span>
+            <span class="z-switch-label">指纹异常自动停用</span>
+          </label>
+        </div>
+      </div>
+      <p class="notice" id="policy-notice" role="status"></p>
+    </section>
+
     <div class="panels">
-      <section class="card" aria-labelledby="manual-title">
+      <section class="z-card" aria-labelledby="manual-title">
         <div class="card-head">
           <div>
             <h2 id="manual-title">手动检测</h2>
-            <p class="muted">选择测试 Client Key、模型、推理档位和指定账号，立即加入执行队列。</p>
+            <p class="card-desc">选择测试 Client Key、模型、推理档位和指定账号，立即加入串行执行队列。</p>
           </div>
         </div>
         <form id="manual" novalidate>
           <div id="manual-target"></div>
           <p class="estimate" id="manual-cost">预计调用：—</p>
           <div class="form-actions">
-            <button type="submit" id="submit-run" disabled>开始检测</button>
-            <button type="button" class="link-btn" id="goto-records" hidden>查看任务记录 →</button>
+            <button class="z-btn z-btn-primary" type="submit" id="submit-run" disabled>开始检测</button>
+            <button class="z-btn z-btn-link" type="button" id="goto-records" hidden>查看任务记录 →</button>
           </div>
-          <p class="muted notice" id="manual-notice" role="status"></p>
+          <p class="notice" id="manual-notice" role="status"></p>
         </form>
       </section>
 
-      <section class="card" aria-labelledby="schedule-title">
+      <section class="z-card" aria-labelledby="schedule-title">
         <div class="card-head">
           <div>
             <h2 id="schedule-title">定时巡检</h2>
-            <p class="muted">默认关闭。按设定周期自动检测指定账号的模型指纹，错过周期不补跑。</p>
+            <p class="card-desc">默认关闭。支持按固定间隔或每日固定时间自动检测指定账号，错过时间槽不补跑积压任务。</p>
           </div>
         </div>
         <form id="schedule" novalidate>
           <div class="schedule-top">
-            <label class="switch"><input id="enabled" type="checkbox">启用定时巡检</label>
-            <label class="inline-field">巡检间隔
-              <select id="hours">
-                <option value="1">每 1 小时</option>
-                <option value="6">每 6 小时</option>
-                <option value="12">每 12 小时</option>
-                <option value="24" selected>每 24 小时</option>
-                <option value="48">每 48 小时</option>
-                <option value="168">每 7 天</option>
-              </select>
+            <label class="z-switch">
+              <input id="enabled" type="checkbox" role="switch">
+              <span class="z-switch-track" aria-hidden="true"><span class="z-switch-thumb"></span></span>
+              <span class="z-switch-label">启用定时巡检</span>
             </label>
+            <div class="z-segmented z-segmented-sm" id="schedule-mode-group" role="radiogroup" aria-label="巡检触发模式">
+              <button type="button" class="z-seg-item is-active" data-mode="interval" role="radio" aria-checked="true">按间隔巡检</button>
+              <button type="button" class="z-seg-item" data-mode="daily" role="radio" aria-checked="false">每日固定时间</button>
+            </div>
           </div>
+
+          <div class="schedule-mode-panel" id="schedule-interval-panel">
+            <div class="field-group">
+              <span class="field-label">巡检间隔</span>
+              <div id="schedule-hours-host"></div>
+            </div>
+          </div>
+
+          <div class="schedule-mode-panel" id="schedule-daily-panel" hidden>
+            <div class="daily-head">
+              <span class="field-label">每日执行时间（最多 12 个时间点）</span>
+              <button type="button" class="z-btn z-btn-plain z-btn-xs" id="add-daily-time">+ 添加时间点</button>
+            </div>
+            <div class="daily-slots" id="daily-slots"></div>
+            <div class="field-group daily-tz-group">
+              <span class="field-label">执行时区</span>
+              <div id="schedule-tz-host"></div>
+            </div>
+          </div>
+
           <div id="schedule-target"></div>
           <p class="estimate" id="schedule-cost">定时巡检已关闭，不会自动发起调用。</p>
           <div class="form-actions">
-            <button class="secondary" type="submit" id="save" disabled>保存巡检设置</button>
+            <button class="z-btn z-btn-primary" type="submit" id="save" disabled>保存巡检设置</button>
           </div>
-          <p class="muted notice" id="schedule-notice" role="status"></p>
+          <p class="notice" id="schedule-notice" role="status"></p>
         </form>
       </section>
     </div>
   </section>
 
+  <!-- Tab 3: 任务记录 -->
   <section id="panel-records" role="tabpanel" aria-labelledby="tab-records" hidden>
-    <section class="card records-card" aria-labelledby="log-title">
-      <div class="records-head">
+    <section class="z-card" aria-labelledby="log-title">
+      <div class="card-head">
         <div>
           <h2 id="log-title">任务记录</h2>
-          <p class="muted">展示执行中、排队中及最近 30 天（最多 500 条）的指纹检测记录，时间按浏览器时区显示。</p>
+          <p class="card-desc">展示执行中、排队中及最近 30 天（最多 500 条）的指纹检测记录，时间按浏览器时区显示。</p>
         </div>
-        <div class="records-actions">
-          <button type="button" class="secondary danger-outline" id="cancel-pending" hidden>取消排队任务</button>
-          <button type="button" class="secondary" id="export-logs">导出诊断日志</button>
-          <button type="button" class="secondary" id="refresh-records">刷新列表</button>
+        <div class="head-actions">
+          <button type="button" class="z-btn z-btn-danger-plain z-btn-sm" id="cancel-pending" hidden>取消排队任务</button>
+          <button type="button" class="z-btn z-btn-secondary z-btn-sm" id="export-logs">导出诊断日志</button>
+          <button type="button" class="z-btn z-btn-secondary z-btn-sm" id="refresh-records">刷新列表</button>
         </div>
+      </div>
+
+      <div id="account-filter-banner" class="filter-chip-bar" hidden>
+        <span class="z-tag z-tag-primary">
+          <span id="account-filter-label"></span>
+          <button type="button" class="tag-close" id="clear-account-filter" aria-label="清除账号筛选">×</button>
+        </span>
       </div>
 
       <div class="quick-pills" id="quick-pills" role="group" aria-label="快捷状态筛选">
-        <button type="button" class="pill active" data-verdict="">全部 <span data-count="all">0</span></button>
-        <button type="button" class="pill" data-verdict="running">检测中 <span data-count="running">0</span></button>
-        <button type="button" class="pill" data-verdict="queued">等待中 <span data-count="queued">0</span></button>
-        <button type="button" class="pill" data-verdict="match">指纹匹配 <span data-count="match">0</span></button>
-        <button type="button" class="pill" data-verdict="ranked">参考排名 <span data-count="ranked">0</span></button>
-        <button type="button" class="pill" data-verdict="suspect">疑似异常 <span data-count="suspect">0</span></button>
-        <button type="button" class="pill" data-verdict="insufficient">证据不足 <span data-count="insufficient">0</span></button>
-        <button type="button" class="pill" data-verdict="failed">检测失败 <span data-count="failed">0</span></button>
+        <button type="button" class="z-pill is-active" data-verdict="">全部 <span data-count="all">0</span></button>
+        <button type="button" class="z-pill" data-verdict="running">检测中 <span data-count="running">0</span></button>
+        <button type="button" class="z-pill" data-verdict="queued">等待中 <span data-count="queued">0</span></button>
+        <button type="button" class="z-pill" data-verdict="match">指纹匹配 <span data-count="match">0</span></button>
+        <button type="button" class="z-pill" data-verdict="ranked">参考排名 <span data-count="ranked">0</span></button>
+        <button type="button" class="z-pill" data-verdict="suspect">疑似异常 <span data-count="suspect">0</span></button>
+        <button type="button" class="z-pill" data-verdict="insufficient">证据不足 <span data-count="insufficient">0</span></button>
+        <button type="button" class="z-pill" data-verdict="failed">检测失败 <span data-count="failed">0</span></button>
       </div>
 
-      <div class="toolbar">
-        <input type="search" id="filter-search" placeholder="搜索账号邮箱、账号 ID、任务 ID 或模型…" aria-label="搜索记录">
-        <select id="filter-source" aria-label="按触发来源筛选">
-          <option value="">全部来源</option>
-          <option value="manual">手动检测</option>
-          <option value="scheduled">定时巡检</option>
-        </select>
-        <select id="filter-verdict" aria-label="按检测状态筛选">
-          <option value="">全部状态</option>
-          <option value="running">检测中</option>
-          <option value="queued">等待检测</option>
-          <option value="match">指纹匹配</option>
-          <option value="ranked">参考排名</option>
-          <option value="suspect">疑似指纹异常</option>
-          <option value="insufficient">证据不足</option>
-          <option value="failed">检测失败</option>
-          <option value="interrupted">已中断</option>
-          <option value="skipped">已跳过</option>
-        </select>
-        <select id="filter-model" aria-label="按模型筛选">
-          <option value="">全部模型</option>
-        </select>
-        <select id="filter-effort" aria-label="按推理档位筛选">
-          <option value="">全部档位</option>
-        </select>
-        <button type="button" class="secondary" id="reset-filters" disabled>重置</button>
+      <div class="toolbar records-toolbar">
+        <div class="z-input-wrap">
+          <span class="z-input-icon" aria-hidden="true">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          </span>
+          <input class="z-input z-input-sm has-icon" type="search" id="filter-search" placeholder="搜索账号邮箱、账号 ID、任务 ID 或模型…" aria-label="搜索记录">
+        </div>
+        <div id="filter-source-host"></div>
+        <div id="filter-verdict-host"></div>
+        <div id="filter-model-host"></div>
+        <div id="filter-effort-host"></div>
+        <button type="button" class="z-btn z-btn-secondary z-btn-sm" id="reset-filters" disabled>重置</button>
       </div>
 
-      <p class="muted notice" id="records-notice" role="status"></p>
-      <p class="empty" id="empty">正在加载…</p>
+      <p class="notice" id="records-notice" role="status"></p>
+      <p class="empty-box" id="empty">正在加载…</p>
 
-      <div class="scroll" id="table-wrap" hidden>
-        <table>
+      <div class="table-scroll" id="table-wrap" hidden>
+        <table class="z-table">
           <caption class="sr-only">模型指纹检测任务与历史记录</caption>
           <thead>
             <tr>
@@ -176,44 +277,35 @@
       <div class="pagination" id="pagination" hidden>
         <div class="page-info" id="page-info"></div>
         <div class="page-controls">
-          <label class="page-size-label">每页
-            <select id="page-size" aria-label="每页显示条数">
-              <option value="10">10 条</option>
-              <option value="20" selected>20 条</option>
-              <option value="50">50 条</option>
-            </select>
-          </label>
+          <div class="page-size-wrap">
+            <span class="muted">每页</span>
+            <div id="page-size-host"></div>
+          </div>
           <div class="page-buttons" id="page-buttons"></div>
         </div>
       </div>
     </section>
 
-    <section class="card log-drawer" id="log-drawer" aria-labelledby="log-drawer-title" hidden>
-      <div class="log-drawer-head">
+    <section class="z-card log-drawer" id="log-drawer" aria-labelledby="log-drawer-title" hidden>
+      <div class="card-head">
         <div>
           <h2 id="log-drawer-title">诊断日志导出</h2>
-          <p class="muted" id="log-drawer-sub">不包含 OAuth Token、Cookie、Client Key 明文或原始对话正文，可直接用于故障排查。</p>
+          <p class="card-desc" id="log-drawer-sub">不包含 OAuth Token、Cookie、Client Key 明文或原始对话正文，可直接用于故障排查。</p>
         </div>
         <div class="log-drawer-controls">
-          <select id="log-scope" aria-label="导出范围">
-            <option value="filtered">当前筛选记录</option>
-            <option value="all">全部任务与运行日志</option>
-          </select>
-          <select id="log-format" aria-label="导出格式">
-            <option value="json">JSON 完整日志</option>
-            <option value="text">纯文本诊断摘要</option>
-          </select>
-          <button type="button" class="secondary" id="log-refresh">重新采集</button>
-          <button type="button" class="secondary" id="log-close">关闭</button>
+          <div id="log-scope-host"></div>
+          <div id="log-format-host"></div>
+          <button type="button" class="z-btn z-btn-secondary z-btn-sm" id="log-refresh">重新采集</button>
+          <button type="button" class="z-btn z-btn-plain z-btn-sm" id="log-close">关闭</button>
         </div>
       </div>
 
       <div id="log-visual" class="log-visual" hidden></div>
 
       <div class="log-export-bar">
-        <button type="button" id="log-copy">一键复制日志</button>
-        <button type="button" class="secondary" id="log-select">全选内容</button>
-        <button type="button" class="secondary" id="log-download" hidden>下载日志文件</button>
+        <button type="button" class="z-btn z-btn-primary z-btn-sm" id="log-copy">一键复制日志</button>
+        <button type="button" class="z-btn z-btn-secondary z-btn-sm" id="log-select">全选内容</button>
+        <button type="button" class="z-btn z-btn-secondary z-btn-sm" id="log-download" hidden>下载日志文件</button>
         <span class="muted log-notice" id="log-notice" role="status"></span>
       </div>
 
@@ -221,7 +313,7 @@
     </section>
   </section>
 
-  <footer id="version" class="muted"></footer>
+  <footer id="version" class="footer muted"></footer>
 </main>
 </body>
 </html>

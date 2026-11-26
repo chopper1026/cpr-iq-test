@@ -13,9 +13,11 @@ import time
 import tomllib
 
 from detector_assets import DATA, ROOT, bank_lock, file_sha, good
-from follow_host import (DIGEST, ID, LEDGER_BRANCH, PRERELEASE, SHA, STABLE, TRIPLES, UPSTREAM, api,
+from follow_host import (DIGEST, ID, LEDGER_BRANCH, LM_UPSTREAM, PRERELEASE, SHA, STABLE, TRIPLES, UPSTREAM, api,
                          download_release_asset, engine_matches, host_source, ledger, own_releases, package_coverage,
-                         package_manifest, prepare_host, read_json, ref_commit, release_asset, write_json)
+                         package_manifest, package_source_hash, parse_semver, prepare_host, read_json, ref_commit,
+                         release_asset, write_json)
+from sync_upstreams import lm_changed_paths
 
 WORKFLOW_PATH = ".github/workflows/follow-host.yml"
 
@@ -56,6 +58,10 @@ def verify_old(plan, triple, work):
     manifest = package_manifest(package)
     if saved["sha256"] != digest or saved["asset"] != name or manifest["version"] != version:
         return label(plan, triple, "block", reason="prior package integrity")
+    if plan.get("detectorRevision") and report.get("detectorRevision") != plan["detectorRevision"]:
+        return label(plan, triple, "rebuild", reason="detector-updated")
+    if plan.get("packageSourceHash") and report.get("packageSourceHash") != plan["packageSourceHash"]:
+        return label(plan, triple, "rebuild", reason="source-updated")
     problem = package_coverage(manifest, plan["contract"]["host"], plan["hostTag"])
     if problem:
         return label(plan, triple, "rebuild" if problem != "wrong plugin identity" else "block", reason=problem)
@@ -191,9 +197,18 @@ def assemble(plan, rows, route, source_commit, candidate_dir=None):
         if row.get("maxGlibc"):
             meta["maxGlibc"] = row["maxGlibc"]
         assets[triple] = meta
-    entry = {"schemaVersion": 1, "hostTag": plan["hostTag"], "hostCommit": plan["hostCommit"], "pluginId": ID,
-             "pluginVersion": version, "sourceCommit": source_commit, "platforms": assets,
-             "detectorRevision": bank_lock()["revision"], "sdkFingerprint": plan["contract"]["sdkFingerprint"]}
+    entry = {
+        "schemaVersion": 1,
+        "hostTag": plan["hostTag"],
+        "hostCommit": plan["hostCommit"],
+        "pluginId": ID,
+        "pluginVersion": version,
+        "sourceCommit": source_commit,
+        "platforms": assets,
+        "detectorRevision": plan.get("detectorRevision") or bank_lock()["revision"],
+        "packageSourceHash": plan.get("packageSourceHash") or package_source_hash(),
+        "sdkFingerprint": plan["contract"]["sdkFingerprint"],
+    }
     if prerelease:
         entry["prerelease"] = True
     return entry, packages
@@ -316,22 +331,40 @@ def publish(args):
         if len(rows) != len(TRIPLES) or {r["triple"] for r in rows} != set(TRIPLES) or any(r["hostCommit"] != plan["hostCommit"] or r["hostTag"] != plan["hostTag"] for r in rows):
             raise ValueError("Incomplete reuse verification")
         entry, packages = assemble(plan, rows, route, args.source)
-        # Reuse the actual published detector metadata, not the data pin of the current checkout.
+        # Reuse the actual published detector and package source metadata, not the current checkout.
         previous = plan["previous"]
         prior = read_json(release_asset(previous["assets"], "verification.json", args.output / "previous"))
         entry["detectorRevision"] = prior["detectorRevision"]
+        if prior.get("packageSourceHash"):
+            entry["packageSourceHash"] = prior["packageSourceHash"]
     else:
         candidates = args.input
         if candidates is None:
             raise ValueError("No candidate packages supplied: release blocked")
         rows = rows_for(plan, sorted(candidates.rglob("candidate.json")))
         entry, packages = assemble(plan, rows, route, args.source, candidates)
-    if old is not None and (
-        old["platforms"] != entry["platforms"]
-        or old["pluginVersion"] != entry["pluginVersion"]
-        or old.get("sourceCommit") != entry["sourceCommit"]
-    ):
-        raise ValueError("Refusing to replace an existing compatibility entry")
+    superseding_ledger = False
+    if old is not None:
+        old_ver = parse_semver(old["pluginVersion"])
+        new_ver = parse_semver(entry["pluginVersion"])
+        if new_ver < old_ver:
+            raise ValueError("Refusing to downgrade an existing compatibility entry")
+        if new_ver == old_ver:
+            if (
+                old["platforms"] != entry["platforms"]
+                or old["pluginVersion"] != entry["pluginVersion"]
+                or old.get("sourceCommit") != entry["sourceCommit"]
+            ):
+                raise ValueError("Refusing to replace an existing compatibility entry")
+        else:
+            superseding_ledger = True
+            prior_history = list(old.get("previousVersions") or [])
+            prior_history.append({
+                "pluginVersion": old["pluginVersion"],
+                "sourceCommit": old.get("sourceCommit"),
+                "detectorRevision": old.get("detectorRevision"),
+            })
+            entry["previousVersions"] = prior_history[-20:]
     verification_file = args.output / "verification.json"
     write_json(verification_file, entry)
     receipt = {
@@ -350,6 +383,7 @@ def publish(args):
         "ledgerBranch": None if prerelease else LEDGER_BRANCH,
         "ledgerPath": None if prerelease else f"compatibility/{entry['hostTag']}.json",
         "ledgerUpdated": False,
+        "ledgerSuperseded": superseding_ledger,
         "remoteAssets": {},
         "resumedFromRunId": getattr(args, "resume_run_id", None) or None,
     }
@@ -365,7 +399,7 @@ def publish(args):
             raise ValueError("Prerelease publication requires explicit --allow-prerelease authorization")
     elif os.environ.get("CPR_ENABLE_PUBLISH") != "true":
         raise ValueError("Remote publication is disabled")
-    if old is not None:
+    if old is not None and not superseding_ledger:
         if old["platforms"] != entry["platforms"] or old["pluginVersion"] != entry["pluginVersion"]:
             raise ValueError("Recorded verified packages changed")
         receipt["stage"] = "verified"
@@ -405,16 +439,21 @@ def publish(args):
                 if existing_tag:
                     raise ValueError(f"Plugin version {tag} tag is already reserved without a matching release; refusing to overwrite")
                 command = ["gh", "release", "--repo", repo]
+                det_short = entry["detectorRevision"][:10]
                 if prerelease:
                     note = (
-                        f"Development preview prerelease verified on CPR {entry['hostTag']} ({entry['hostCommit']}). "
-                        "Does not occupy a stable version or update cpr-compatibility. "
+                        f"Development preview prerelease verified on CPR {entry['hostTag']} ({entry['hostCommit'][:10]}) "
+                        f"with lm-detector {det_short}. Does not occupy a stable version or update cpr-compatibility. "
                         "Install only after checking verification.json and checksums.txt."
                     )
                     create_flags = ["--draft", "--prerelease"]
                     promote_flags = ["--draft=false", "--prerelease", "--latest=false"]
                 else:
-                    note = f"Native plugin verified on CPR {entry['hostTag']} ({entry['hostCommit']}). Install only after checking verification.json and checksums.txt. No automatic production upgrade."
+                    note = (
+                        f"Stable native plugin verified on CPR {entry['hostTag']} ({entry['hostCommit'][:10]}) "
+                        f"with lm-detector {det_short}. Install only after checking verification.json and checksums.txt. "
+                        "No automatic production upgrade."
+                    )
                     create_flags = ["--draft"]
                     promote_flags = ["--draft=false", "--latest"]
                 run_gh_retry(
@@ -460,10 +499,22 @@ def publish(args):
             branch = f"repos/{repo}/git/ref/heads/{LEDGER_BRANCH}"
             if api(branch, missing=True) is None:
                 git_write(f"repos/{repo}/git/refs", {"ref": "refs/heads/" + LEDGER_BRANCH, "sha": args.source})
-            git_write(f"repos/{repo}/contents/compatibility/{entry['hostTag']}.json", {
-                "message": f"Record verified compatibility with CPR {entry['hostTag']}", "branch": LEDGER_BRANCH,
+            ledger_route = f"repos/{repo}/contents/compatibility/{entry['hostTag']}.json"
+            ledger_payload = {
+                "message": (
+                    f"Update verified compatibility for CPR {entry['hostTag']} to v{entry['pluginVersion']}"
+                    if superseding_ledger
+                    else f"Record verified compatibility with CPR {entry['hostTag']}"
+                ),
+                "branch": LEDGER_BRANCH,
                 "content": base64.b64encode(verification_file.read_bytes()).decode(),
-            })
+            }
+            if superseding_ledger:
+                existing_blob = api(f"{ledger_route}?ref={LEDGER_BRANCH}", missing=True)
+                if not existing_blob or not existing_blob.get("sha"):
+                    raise RuntimeError("Missing existing ledger blob SHA for monotonic compatibility update")
+                ledger_payload["sha"] = existing_blob["sha"]
+            git_write(ledger_route, ledger_payload)
             receipt["ledgerUpdated"] = True
         last_stage = "verified"
         receipt["stage"] = last_stage
@@ -503,10 +554,12 @@ def verify_resume(args):
         raise ValueError(f"Run {args.run_id} belongs to {run.get('path')!r}, not {WORKFLOW_PATH}")
     if run.get("head_branch") != args.default_branch:
         raise ValueError(f"Run {args.run_id} was not executed on default branch {args.default_branch}")
-    if run.get("head_sha") != args.source:
-        raise ValueError(f"Run {args.run_id} head_sha {run.get('head_sha')} does not match current commit {args.source}")
     jobs = list_run_jobs(repo, args.run_id)
     by_name = {job["name"]: job for job in jobs}
+    if run.get("head_sha") != args.source:
+        sync_job = by_name.get("sync-upstreams")
+        if not (sync_job and sync_job.get("conclusion") == "success"):
+            raise ValueError(f"Run {args.run_id} head_sha {run.get('head_sha')} does not match current commit {args.source}")
     for required in ("discover", "host-contract", "decide"):
         job = by_name.get(required)
         if job is None or job.get("conclusion") != "success":
@@ -572,6 +625,7 @@ def preflight(args):
         "engines": author["engines"]["codex-proxy-rs"],
         "sdkPin": cargo["dependencies"]["gateway-plugin-sdk"]["rev"],
         "detectorRevision": lock["revision"],
+        "packageSourceHash": package_source_hash(),
         "localAssetsReady": all(local_assets.values()),
         "localAssets": local_assets,
         "git": git_info,
@@ -585,10 +639,19 @@ def preflight(args):
         rel = api(f"repos/{UPSTREAM}/releases/" + ("tags/" + tag_arg if tag_arg else "latest"))
         tag = rel["tag_name"]
         sha = ref_commit(UPSTREAM, "tags", tag)
+        lm_latest = ref_commit(LM_UPSTREAM, "heads", "main")
+        lm_paths = lm_changed_paths(LM_UPSTREAM, lock["revision"], lm_latest)
         upstream_info = {
             "hostTag": tag,
             "hostCommit": sha,
             "engineCoversUpstream": engine_matches(author["engines"]["codex-proxy-rs"], tag),
+            "lmDetector": {
+                "repository": LM_UPSTREAM,
+                "pinnedRevision": lock["revision"],
+                "latestRevision": lm_latest,
+                "changedPaths": lm_paths,
+                "updateAvailable": bool(lm_paths),
+            },
         }
         if args.repository:
             known = ledger(args.repository, tag)
@@ -598,6 +661,11 @@ def preflight(args):
                               if STABLE.fullmatch(r["tag_name"]) and r["tag_name"].startswith(f"v{series}.")]
             upstream_info["ledgerRecorded"] = known is not None
             upstream_info["ledgerCommitMatches"] = (known["hostCommit"] == sha) if known else None
+            upstream_info["ledgerSourceCurrent"] = (
+                bool(known and known.get("detectorRevision") == lock["revision"]
+                     and known.get("packageSourceHash") == report["packageSourceHash"])
+                if known else False
+            )
             upstream_info["draftReleases"] = [r["tag_name"] for r in releases if r.get("draft")]
             upstream_info["nextCandidateVersion"] = f"{series}.{1 + max(series_patches, default=-1)}"
         report["upstream"] = upstream_info

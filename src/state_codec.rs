@@ -131,6 +131,9 @@ mod tests {
                     used_outputs: Some(3),
                     probability_status: Some("ReferenceCalibrated".into()),
                     error_detail: None,
+                    auto_disabled: None,
+                    auto_disable_note: None,
+                    auto_disable_error: None,
                     probes: (1..=3)
                         .map(|p| ProbeDiagnostic {
                             index: p,

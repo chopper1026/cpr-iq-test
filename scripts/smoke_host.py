@@ -277,21 +277,55 @@ def smoke(args):
             base_url = prefix_for(ext)
             assert any(page["entry"] == "web/index.html" for page in ext["pages"])
             html = api.call("GET", base_url + "/resources/web/index.html")
-            assert b"app.js" in html and b"tab-records" in html and b"export-logs" in html
+            assert (
+                b"app.js" in html
+                and b"tab-status" in html
+                and b"tab-records" in html
+                and b"export-logs" in html
+                and b"auto-disable-on-suspect" in html
+            )
             assert api.call("GET", base_url + "/resources/web/app.js")
             assert api.call("GET", base_url + "/resources/web/style.css")
             catalog = api.call("GET", base_url + "/api/catalog")
             assert catalog["detectorReady"] and not catalog["accounts"] and not catalog["keys"] and catalog["models"] == [], catalog
+            acct_status = api.call("GET", base_url + "/api/accounts/status")
+            assert acct_status["summary"]["total"] == 0 and acct_status["accounts"] == [], acct_status
             runs = api.call("GET", base_url + "/api/runs?page=1&pageSize=20")
             assert not runs["items"] and runs["pagination"]["total"] == 0, runs
             empty_logs = api.call("GET", base_url + "/api/logs?scope=all")
             assert empty_logs["recordCount"] == 0 and empty_logs["runtimeLogCount"] >= 1, empty_logs
             assert api.call("POST", base_url + "/api/runs/cancel", {}) == {"cancelled": 0}
             default = api.call("GET", base_url + "/api/schedule")["settings"]
-            assert default == {"enabled": False, "hours": 24, "target": None}, default
-            settings = {**default, "hours": 12}
-            edited = api.call("PUT", base_url + "/api/schedule", {"settings": settings, "previous": default})
+            assert default == {
+                "enabled": False,
+                "mode": "interval",
+                "hours": 24,
+                "dailyTimes": ["09:00"],
+                "utcOffsetMinutes": 0,
+                "autoDisableOnSuspect": False,
+                "target": None,
+            }, default
+            toggled_only = {
+                **default,
+                "autoDisableOnSuspect": True,
+                "utcOffsetMinutes": 480,
+            }
+            edited_guard = api.call("PUT", base_url + "/api/schedule", {"settings": toggled_only, "previous": default})
+            assert edited_guard["settings"] == toggled_only and edited_guard["nextDueAt"] is None
+            settings = {
+                **toggled_only,
+                "mode": "daily",
+                "hours": 12,
+                "dailyTimes": ["09:00", "21:30"],
+                "utcOffsetMinutes": 480,
+                "autoDisableOnSuspect": True,
+            }
+            edited = api.call("PUT", base_url + "/api/schedule", {"settings": settings, "previous": toggled_only})
             assert edited["settings"] == settings and edited["nextDueAt"] is None
+            api.call("PUT", base_url + "/api/schedule", {
+                "settings": {**settings, "dailyTimes": ["25:99"]},
+                "previous": settings,
+            }, expected=400)
             api.call("POST", base_url + "/api/runs", {"runId": "m-invalidsmoke", "target": {
                 "clientKeyId": "key-fixture", "model": "", "effort": "low", "accountIds": ["no-account"]}}, expected=400)
             if args.baseline:

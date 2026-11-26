@@ -13,9 +13,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 
 from detector_assets import file_sha
-from follow_host import TRIPLES, discovery, engine_matches, package_coverage, read_json, write_json
+from follow_host import (TRIPLES, discovery, engine_matches, package_coverage, package_source_hash, read_json,
+                         write_json)
 from release_gate import (WORKFLOW_PATH, assemble, classify, filename, label, preflight, publish, reduce, rows_for,
                           run_gh_retry, verify_old, verify_remote_release, verify_resume)
+from sync_upstreams import build_commit_message, lm_changed_paths, update_cargo_dep_rev, update_rust_version
 
 
 def make_remote_release(tag, files, *, draft=False, prerelease=False, published_at="2026-11-25T13:00:00Z", include_digest=True):
@@ -581,6 +583,164 @@ class FollowRelease(unittest.TestCase):
                 run_gh_retry(["gh", "release", "create"])
             self.assertEqual(run.call_count, 1)
             sleep_mock.assert_not_called()
+
+    def test_verify_old_triggers_rebuild_when_detector_or_package_source_updates(self):
+        triple = TRIPLES[0]
+        artifact_name = filename(self.default_version, triple)
+        verification = {
+            "pluginVersion": self.default_version,
+            "sourceCommit": self.sha,
+            "sdkFingerprint": "ef",
+            "detectorRevision": "old-det-rev",
+            "packageSourceHash": "old-src-hash",
+            "platforms": {triple: {"asset": artifact_name, "sha256": "b" * 64}},
+        }
+        plan = {**self.plan, "detectorRevision": "new-det-rev", "packageSourceHash": "old-src-hash"}
+        with (patch("release_gate.release_asset", return_value=pathlib.Path("fixture.tar.gz")),
+              patch("release_gate.read_json", return_value=verification),
+              patch("release_gate.file_sha", return_value="b" * 64),
+              patch("release_gate.package_manifest", return_value=self.author),
+              patch("release_gate.smoke", return_value=True) as run):
+            res = verify_old(plan, triple, pathlib.Path("dummy"))
+            self.assertEqual(res["status"], "rebuild")
+            self.assertEqual(res["reason"], "detector-updated")
+            run.assert_not_called()
+
+            plan["detectorRevision"] = "old-det-rev"
+            plan["packageSourceHash"] = "new-src-hash"
+            res2 = verify_old(plan, triple, pathlib.Path("dummy"))
+            self.assertEqual(res2["status"], "rebuild")
+            self.assertEqual(res2["reason"], "source-updated")
+            run.assert_not_called()
+
+    def test_publish_monotonically_updates_ledger_for_newer_stable_version_and_blocks_downgrade(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = pathlib.Path(scratch)
+            paths, packages = self.make_publish_fixture(root)
+            tag = "v" + self.plan["candidateVersion"]  # v0.1.9 superseding v0.1.8
+            existing_ledger = {
+                "schemaVersion": 1,
+                "hostTag": self.plan["hostTag"],
+                "hostCommit": self.sha,
+                "pluginVersion": "0.1.8",
+                "sourceCommit": "c" * 40,
+                "detectorRevision": "old-det",
+                "platforms": {},
+            }
+            state = {"created": False}
+
+            def fake_run(cmd, **kwargs):
+                if "create" in cmd:
+                    state["created"] = True
+
+            def fake_own_releases(_repo):
+                if not state["created"]:
+                    return []
+                files = (*packages, paths.output / "checksums.txt", paths.output / "verification.json")
+                return [make_remote_release(tag, files, draft=True)]
+
+            def fake_api(route, missing=False):
+                if route == f"repos/example/plugin/releases/tags/{tag}":
+                    files = (*packages, paths.output / "checksums.txt", paths.output / "verification.json")
+                    return make_remote_release(tag, files, draft=False)
+                if route.startswith("repos/example/plugin/contents/compatibility/"):
+                    return {"sha": "blobsha123"}
+                if route.startswith("repos/example/plugin/git/ref/heads/"):
+                    return {"object": {"sha": self.sha}}
+                return None
+
+            with (patch("release_gate.ledger", return_value=existing_ledger),
+                  patch("release_gate.api", side_effect=fake_api),
+                  patch("release_gate.own_releases", side_effect=fake_own_releases),
+                  patch("release_gate.ref_commit", return_value=self.sha),
+                  patch("release_gate.subprocess.run", side_effect=fake_run),
+                  patch("release_gate.git_write") as write,
+                  patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true",
+                                          "CPR_ENABLE_PUBLISH": "true"})):
+                publish(paths)
+                ledger_call = write.call_args_list[-1]
+                self.assertIn("compatibility/v3.54.6.json", ledger_call.args[0])
+                self.assertEqual(ledger_call.args[1]["sha"], "blobsha123")
+                verification = read_json(paths.output / "verification.json")
+                self.assertEqual(verification["previousVersions"][-1]["pluginVersion"], "0.1.8")
+                receipt = read_json(paths.output / "publish-receipt.json")
+                self.assertTrue(receipt["ledgerSuperseded"])
+                self.assertTrue(receipt["ledgerUpdated"])
+
+            # Downgrade (0.1.9 -> 0.1.8) must fail closed.
+            newer_ledger = {**existing_ledger, "pluginVersion": "0.1.10"}
+            with (patch("release_gate.ledger", return_value=newer_ledger),
+                  patch.dict(os.environ, {"GITHUB_REPOSITORY": "example/plugin", "GITHUB_ACTIONS": "true",
+                                          "CPR_ENABLE_PUBLISH": "true"})):
+                with self.assertRaisesRegex(ValueError, "downgrade"):
+                    publish(paths)
+
+    def test_lm_detector_watcher_ignores_web_commits_and_detects_data_or_sdk_changes(self):
+        with patch("sync_upstreams.api", return_value={
+            "status": "ahead",
+            "files": [{"filename": "web/src/app.tsx"}, {"filename": "README.md"}],
+        }):
+            self.assertEqual(lm_changed_paths("Ikaleio/lm-detector", "1" * 40, "2" * 40), [])
+
+        with patch("sync_upstreams.api", return_value={
+            "status": "ahead",
+            "files": [
+                {"filename": "web/src/app.tsx"},
+                {"filename": "data/unified_bank.json"},
+                {"filename": "sdk/rust/src/scoring.rs"},
+            ],
+        }):
+            self.assertEqual(
+                lm_changed_paths("Ikaleio/lm-detector", "1" * 40, "2" * 40),
+                ["data/unified_bank.json", "sdk/rust/src/scoring.rs"],
+            )
+
+        # Fallback to tree fingerprint comparison when compare returns diverged or >=300 files.
+        def fake_tree_api(route, missing=False):
+            if "/compare/" in route:
+                return {"status": "diverged", "files": []}
+            if "contents/data?ref=old" in route:
+                return [{"name": "unified_bank.json", "sha": "aaa"}, {"name": "shared_detector.bin", "sha": "bbb"}]
+            if "contents/data?ref=new" in route:
+                return [{"name": "unified_bank.json", "sha": "ccc"}, {"name": "shared_detector.bin", "sha": "bbb"}]
+            if "contents/sdk?ref=old" in route:
+                return [{"name": "rust", "sha": "rrr"}]
+            if "contents/sdk?ref=new" in route:
+                return [{"name": "rust", "sha": "rrr"}]
+            return []
+
+        with patch("sync_upstreams.api", side_effect=fake_tree_api):
+            self.assertEqual(lm_changed_paths("Ikaleio/lm-detector", "old", "new"), ["data/unified_bank.json"])
+
+    def test_sync_upstreams_updates_cargo_and_toolchain_pins_and_hashes_package_source(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = pathlib.Path(scratch)
+            cargo = root / "Cargo.toml"
+            toolchain = root / "rust-toolchain.toml"
+            cargo.write_text(
+                '[package]\nname = "demo"\nrust-version = "1.99.1"\n'
+                '[dependencies]\n'
+                'gateway-plugin-sdk = { git = "https://github.com/zyycn/codex-proxy-rs.git", rev = "' + ("a" * 40) + '", features = ["io"] }\n'
+                'lmfpd = { git = "https://github.com/Ikaleio/lm-detector.git", rev = "' + ("b" * 40) + '" }\n'
+            )
+            toolchain.write_text('[toolchain]\nchannel = "1.99.1"\n')
+            update_cargo_dep_rev(cargo, "lmfpd", "b" * 40, "c" * 40)
+            update_rust_version(toolchain, cargo, "1.100.0")
+            self.assertIn("c" * 40, cargo.read_text())
+            self.assertIn("a" * 40, cargo.read_text())
+            self.assertIn('rust-version = "1.100.0"', cargo.read_text())
+            self.assertIn('channel = "1.100.0"', toolchain.read_text())
+
+            msg = build_commit_message({
+                "host": {"needsSync": True, "tag": "v3.55.2", "commit": "d" * 40, "currentEngines": "~3.54.5",
+                         "targetEngines": "~3.55.2", "engineNeedsUpdate": True, "sdkChanged": True,
+                         "rustChanged": False, "currentRust": "1.99.1", "targetRust": "1.99.1"},
+                "lmDetector": {"needsSync": True, "currentRevision": "b" * 40, "latestRevision": "c" * 40,
+                               "changedPaths": ["data/unified_bank.json"]},
+            })
+            self.assertIn("CPR v3.55.2", msg)
+            self.assertIn("lm-detector", msg)
+            self.assertEqual(len(package_source_hash()), 64)
 
 
 if __name__ == "__main__":

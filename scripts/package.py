@@ -102,7 +102,7 @@ def main():
     parser.add_argument("--host-sha", required=True)
     parser.add_argument("--host-tag", required=True)
     parser.add_argument("--target", required=True, choices=TRIPLES)
-    parser.add_argument("--version", default="0.1.0-dev.1")
+    parser.add_argument("--version", default="0.1.0")
     parser.add_argument("--out", type=pathlib.Path, default=ROOT / "dist")
     parser.add_argument("--baseline-out", type=pathlib.Path, help="also build an older version for state-upgrade smoke only")
     parser.add_argument("--offline", action="store_true", help="verify local detector assets instead of downloading")
