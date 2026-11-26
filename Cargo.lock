@@ -376,7 +376,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "lmfpd"
 version = "0.2.0"
-source = "git+https://github.com/Ikaleio/lm-detector.git?rev=e0472890bea827d15ca883636a77d4c10bbe843b#e0472890bea827d15ca883636a77d4c10bbe843b"
+source = "git+https://github.com/Ikaleio/lm-detector.git?rev=6530eeea79bb3794bd7b0e9f1b1c180921c924b3#6530eeea79bb3794bd7b0e9f1b1c180921c924b3"
 dependencies = [
  "getrandom 0.4.3",
  "regex",
