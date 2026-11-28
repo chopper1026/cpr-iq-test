@@ -7,7 +7,7 @@
   "description": "指定账号的模型参考指纹检测与定时巡检，支持可选的指纹异常自动停用与备注记录。",
   "license": "Apache-2.0",
   "engines": {
-    "codex-proxy-rs": "~3.57.0"
+    "codex-proxy-rs": "~3.58.0"
   },
   "main": "bin/plugin",
   "runtime": "trustedProcess",
